@@ -13,7 +13,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SITES } from '../lib/index.js'
+import { SITES } from '../lib/impl.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const appId = process.argv[2]
@@ -32,7 +32,7 @@ if (!stored.secretId || !stored.secretKey) {
 const patch = await readFile(join(here, '..', 'cordis.patch.yml'), 'utf8')
 const site = stored.site ?? /^\s*site:\s*(\S+)\s*$/m.exec(patch)?.[1] ?? 'cn'
 
-const mod = await import(new URL('../lib/index.js', import.meta.url).href)
+const mod = await import(new URL('../lib/impl.js', import.meta.url).href)
 
 /* ---- the same fake Host surface the self-test builds ---- */
 const routes = []

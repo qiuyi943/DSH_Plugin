@@ -148,13 +148,14 @@ cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modu
 > （`button-primary-fill` / `label-primary-foreground` / `brand-primary` / `border-l3`），
 > **样式里不再有任何字面颜色**；自测里有一条守卫同时检查「无字面颜色」与「配对 token」。
 
-> **改 Host 代码后如何不重启就生效。** DSH 的 Loader 用 `await import(name)` 加载插件，没有
-> cache-busting，模块 URL 一旦加载就在进程内永久缓存 —— 所以 `set_bundle` 关→开只会重跑 `apply`，
-> 拿到的是**旧模块**；`install_bundle` 也会返回 `restart-required`。唯一的热加载办法是**让模块 URL 变化**：
-> 本插件的 patch 行因此写成**相对路径** `name: './lib/index.js'`（而不是包名 `@local/adp-console`），
-> Loader 走 `new URL(name, baseUrl)` 分支解析出文件 URL。改动后只需把入口文件挪到一个新路径
-> （或改行名指向新文件），再 `set_bundle` 关→开，新代际立即生效 —— 已实测，无需重启。
-> 入口保持相对路径还有一个好处：不必依赖 profile 的 node_modules 解析。
+> **改 Host 代码后如何不重启就生效。** DSH 的 Cordis Loader 用 `await import(name)` 加载插件，
+> **没有 cache-busting**，模块 URL 一旦加载就在进程内永久缓存；`install_bundle` 也只会返回
+> `restart-required`，`set_bundle` 关→开则只重跑 `apply`、拿到的仍是旧模块。
+> 所以本插件的入口 `lib/entry.js` **不承载任何逻辑**，它每次被激活时都用**带 `?rev=<时间戳>` 的
+> 动态 import** 加载真正的实现 `lib/impl.js`。
+>
+> 于是：**改完 `lib/impl.js`，`set_bundle` 关→开即可生效，不用重启、也不用改文件名** —— 已实测。
+> （Node 的 ESM 按完整 URL 区分模块身份：查询串不同就会重新求值，相同则命中缓存。）
 
 > **冷启动必须用 `ctx.inject(['webServer'], …)` 注册路由**。最初这里写的是
 > `const webServer = ctx.get('webServer')`，一次性取值 —— 插件在冷启动时比 HTTP 载体先激活，
@@ -215,7 +216,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 87 项 | 通过 |
+| 自测 95 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -295,6 +296,31 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 会话超时：改成「按存活性」判定，而不是总时长
+
+用户报的「websocket 超时」有两个来源，都已修掉：
+
+**① 服务端主动断开时被静默忽略。** 实测握手被拒时服务端发的是
+`42["error",{"Code":460001,"Message":"Token 校验失败"}]`，紧接 `41`（Socket.IO 断开）、
+再以 `1006` 关闭。原实现忽略了 `41`，于是一路等到硬超时才报错。现在：
+
+| 情况 | 现在的行为 |
+| --- | --- |
+| `41` / Engine.IO `1` / 未完成即关闭 | **立即** `ChatWsClosed`，不再等超时 |
+| `44{...}`（握手被拒） | **立即** `ChatConnectError`，并带上服务端原文 |
+| 长时间没有任何帧（含心跳） | `ChatStalled`，默认 **90s**（服务端每 25s ping，可容忍约 3 次丢包） |
+| 单轮总时长 | `ChatTimeout`，默认 **15 分钟**（Claw 任务本来就慢，原来是 180s 硬上限） |
+
+**② 原来用的是「总时长 180 秒」硬上限**，而 Claw 模式任务跑沙箱、动辄数分钟，很容易被误杀。
+现在超时判据是**存活性**：任何一帧（包括心跳 `2`）都会重置计时器 —— 只要连接活着、
+Agent 还在干活，就不会被判定超时。
+
+两个值都可在 config 里调：`chatIdleTimeoutMs` / `chatTimeoutMs`；`adp_chat` 工具自身的
+`timeoutMs` 也跟随 `chatTimeoutMs`。SSE 通道同样加了失活保护（超时即 abort，而不是无限等待），
+失败时若已收到部分文本，会通过 `partialText` 带给面板，不会白丢。
+
+自测里用**只完成 WebSocket 握手、随后保持沉默**的迷你服务端确定性地覆盖了这三种情形。
 
 ### 顺带修掉的两个真 bug
 
@@ -400,7 +426,8 @@ WS 握手（按文档实现，Socket.IO v4）：
 | --- | --- |
 | `package.json` | bundle 清单（`dsh.bundle.patch` + `dsh.client`），无任何运行时依赖 |
 | `cordis.patch.yml` | profile 里插入的那一行 |
-| `lib/index.js` | Host 半：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话 |
+| `lib/entry.js` | bundle 入口（稳定壳）：每次激活用带 `?rev=` 的动态 import 加载实现，使改动无需重启即可生效 |
+| `lib/impl.js` | Host 半实现：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话与超时治理 |
 | `client.js` | Client 半：侧边栏图标 + 主面板页面 + 流式会话 |
 | `locale/zh.json`、`locale/en.json` | 插件卡片的标题与描述 |
 | `icon.svg` | 侧边栏与插件卡片图标 |
@@ -408,5 +435,5 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 **注意**：Host 半刻意不 import 任何 Harness 包。工作区 bundle 无法解析
 `@deepseek-ai/*`（profile 的 `node_modules` 里只有你自己的包），所以本插件只用
-Node 内置模块；配置默认值在 `lib/index.js` 的 `DEFAULT_CONFIG` 里，运行期需要用户调整的
+Node 内置模块；配置默认值在 `lib/impl.js` 的 `DEFAULT_CONFIG` 里，运行期需要用户调整的
 东西都放在面板的「设置」里。

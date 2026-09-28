@@ -10,6 +10,7 @@
  */
 
 import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -291,7 +292,7 @@ const port = await new Promise((resolve) => {
 })
 const origin = `127.0.0.1:${port}`
 
-const mod = await import(pathToFileURL(join(here, '..', 'lib', 'index.js')).href)
+const mod = await import(pathToFileURL(join(here, '..', 'lib', 'impl.js')).href)
 
 /** The harness the main scenarios run against. */
 const primary = createHarness()
@@ -901,6 +902,141 @@ check(
   'useSdk:false falls back to the built-in TC3 signer',
   lastRequestClient === null && httpListed.json.ok === true && lastVersion === '2026-05-20',
   `X-TC-RequestClient=${JSON.stringify(lastRequestClient)} · X-TC-Version=${JSON.stringify(lastVersion)}`,
+)
+
+/* --- 14. Conversation timeouts: stall, disconnect and rejected handshake --- */
+// A minimal RFC6455 server: it completes the upgrade so the client's socket opens, then
+// behaves exactly like the failure modes observed on the real endpoint.
+async function startSocketServer(onUpgrade) {
+  // Upgraded sockets outlive `server.close()`, so they are tracked and destroyed —
+  // otherwise the test process never exits.
+  const sockets = []
+  const server = createServer()
+  server.on('upgrade', (request, socket) => {
+    sockets.push(socket)
+    const accept = createHash('sha1')
+      .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\n'
+      + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+      + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`)
+    onUpgrade?.(socket)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  server.unref()
+  return {
+    port: server.address().port,
+    stop() {
+      for (const socket of sockets) socket.destroy()
+      server.close()
+    },
+  }
+}
+
+/** One unmasked text frame, server → client. */
+function sendTextFrame(socket, text) {
+  const payload = Buffer.from(text, 'utf8')
+  const header = payload.length < 126
+    ? Buffer.from([0x81, payload.length])
+    : Buffer.concat([Buffer.from([0x81, 126]), (() => { const b = Buffer.alloc(2); b.writeUInt16BE(payload.length); return b })()])
+  socket.write(Buffer.concat([header, payload]))
+}
+
+/** Run one WS turn against a fake server and report the outcome. */
+async function wsTurn(port, idleTimeoutMs = 400) {
+  try {
+    const result = await mod.streamAdpChatWs({
+      wsEndpoint: `ws://127.0.0.1:${port}/adp/v2/chat/conn/`,
+      token: 'test-token',
+      conversationId: 'c'.repeat(32),
+      message: '你好',
+      userId: 'dsh-test',
+      idleTimeoutMs,
+      timeoutMs: 5000,
+    })
+    return { ok: true, result }
+  } catch (error) {
+    return { ok: false, code: error?.code, message: error?.message ?? String(error), partialText: error?.partialText }
+  }
+}
+
+// ① The socket opens and then stays completely silent → the stall guard must fire.
+const silent = await startSocketServer(() => {})
+const stallStarted = Date.now()
+const stalled = await wsTurn(silent.port, 400)
+const stallElapsed = Date.now() - stallStarted
+silent.stop()
+check(
+  'a silent socket fails as ChatStalled, not as a long timeout',
+  stalled.ok === false && stalled.code === 'ChatStalled',
+  `${stalled.code} — ${stalled.message}`,
+)
+check(
+  'the stall guard fires on the idle window, not the total cap',
+  stallElapsed >= 400 && stallElapsed < 3000,
+  `${stallElapsed}ms（idle=400ms，total=5000ms）`,
+)
+
+// ② Opening frame then an immediate disconnect → ChatWsClosed, not a timeout.
+const closing = await startSocketServer((socket) => {
+  sendTextFrame(socket, '0{"sid":"x","pingInterval":25000,"pingTimeout":5000}')
+  setTimeout(() => { sendTextFrame(socket, '41'); socket.end() }, 60)
+})
+const closed = await wsTurn(closing.port, 3000)
+closing.stop()
+check(
+  'a server-side disconnect fails fast as ChatWsClosed',
+  closed.ok === false && closed.code === 'ChatWsClosed',
+  `${closed.code} — ${closed.message}`,
+)
+
+// ③ A rejected handshake token → the Socket.IO connect-error frame must surface.
+const rejected = await startSocketServer((socket) => {
+  sendTextFrame(socket, '0{"sid":"x","pingInterval":25000,"pingTimeout":5000}')
+  setTimeout(() => sendTextFrame(socket, '44{"message":"handshake token rejected"}'), 60)
+})
+const handshakeRefused = await wsTurn(rejected.port, 3000)
+rejected.stop()
+check(
+  'a rejected handshake surfaces as ChatConnectError with the server text',
+  handshakeRefused.ok === false && handshakeRefused.code === 'ChatConnectError'
+    && handshakeRefused.message.includes('handshake token rejected'),
+  `${handshakeRefused.code} — ${handshakeRefused.message}`,
+)
+check(
+  'the timeout knobs are configurable',
+  mod.DEFAULT_CONFIG.chatIdleTimeoutMs === 90000 && mod.DEFAULT_CONFIG.chatTimeoutMs === 900000,
+  `idle=${mod.DEFAULT_CONFIG.chatIdleTimeoutMs} total=${mod.DEFAULT_CONFIG.chatTimeoutMs}`,
+)
+
+/* --- 15. Stable entry: a fresh implementation per activation --- */
+// The entry holds no logic; it re-imports the implementation under a new `?rev=` URL on
+// every activation, which is what makes a bundle toggle pick up current source without a
+// DSH restart. Two activations must therefore not share module state.
+const entry = await import(pathToFileURL(join(here, '..', 'lib', 'entry.js')).href)
+check(
+  'the bundle entry declares name and inject statically',
+  entry.name === 'adp-console' && Array.isArray(entry.inject) && entry.inject.includes('tools'),
+  `name=${entry.name} inject=${JSON.stringify(entry.inject)}`,
+)
+
+const entryHarness = createHarness()
+entry.apply(entryHarness.ctx, {
+  secretId: 'AKIDentry', secretKey: 'SECRETentry', region: 'ap-guangzhou', spaceId: 'default_space',
+  site: 'standalone', endpoint: origin, chatEndpoint: '', wsEndpoint: '', protocol: 'http',
+  apiVersion: '2026-05-20', routePrefix: '/adp-console', statePath: join(stateDir, 'state-entry.json'),
+  defaultEnabledAppIds: [], requestTimeoutMs: 10000, releaseTimeoutMs: 5000, appKeyCacheMs: 1000,
+  exposeTools: true, chatTransport: 'auto',
+})
+await entry.whenReady()
+check(
+  'activation through the entry registers its tools and route',
+  entryHarness.tools.size === 5 && entryHarness.routes.length === 1,
+  `tools=${entryHarness.tools.size} routes=${entryHarness.routes.length}`,
+)
+check(
+  'the entry answers through the registered route',
+  (await entryHarness.call('GET', '/config')).json.ok === true,
 )
 
 gateway.close()

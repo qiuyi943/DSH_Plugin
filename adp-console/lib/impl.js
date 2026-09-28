@@ -58,6 +58,14 @@ export const DEFAULT_CONFIG = {
    * Socket.IO channel when the SSE service cannot resolve the app, `sse`/`ws` force one.
    */
   chatTransport: 'auto',
+  /**
+   * Stall guard: no frame at all (heartbeats included) for this long means the
+   * connection is dead. The server pings every 25s, so this tolerates ~3 missed
+   * heartbeats before giving up on a turn that is otherwise still running.
+   */
+  chatIdleTimeoutMs: 90000,
+  /** Absolute cap for one conversation turn. Claw-mode tasks can legitimately run minutes. */
+  chatTimeoutMs: 900000,
   /** Same-origin route prefix the Client panel talks to. */
   routePrefix: '/adp-console',
   /** Path of the persisted gate and credentials. Empty = $DSH_HOME/adp-console/state.json. */
@@ -998,11 +1006,22 @@ export async function streamAdpChat(options) {
   }
   if (userName) body.UserName = userName
 
+  // The SSE stream can also go quiet; abort the request instead of hanging forever.
+  const idleTimeoutMs = options.idleTimeoutMs ?? 90000
+  const controller = new AbortController()
+  let stalled = false
+  let idleTimer = setTimeout(() => { stalled = true; controller.abort() }, idleTimeoutMs)
+  const bump = () => {
+    clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => { stalled = true; controller.abort() }, idleTimeoutMs)
+  }
+  signal?.addEventListener('abort', () => controller.abort(), { once: true })
+
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(body),
-    signal,
+    signal: controller.signal,
   })
   if (!response.ok) {
     const detail = await response.text().catch(() => '')
@@ -1016,21 +1035,34 @@ export async function streamAdpChat(options) {
   const decoder = new TextDecoder('utf-8')
   const reducer = createChatReducer(onEvent)
   let buffer = ''
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true })
-    let boundary = findEventBoundary(buffer)
-    while (boundary >= 0) {
-      const raw = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + (buffer[boundary] === '\r' ? 4 : 2))
-      dispatchSseBlock(raw, (name, payload) => { reducer.push(name, payload) })
-      boundary = findEventBoundary(buffer)
+  try {
+    for await (const chunk of response.body) {
+      bump()
+      buffer += decoder.decode(chunk, { stream: true })
+      let boundary = findEventBoundary(buffer)
+      while (boundary >= 0) {
+        const raw = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + (buffer[boundary] === '\r' ? 4 : 2))
+        dispatchSseBlock(raw, (name, payload) => { reducer.push(name, payload) })
+        boundary = findEventBoundary(buffer)
+      }
     }
+    buffer += decoder.decode()
+    if (buffer.trim() !== '') dispatchSseBlock(buffer, (name, payload) => { reducer.push(name, payload) })
+  } catch (error) {
+    if (!stalled) throw error
+    const failure = new AdpError(
+      `SSE 会话已 ${Math.round(idleTimeoutMs / 1000)} 秒没有收到任何数据。`,
+      { code: 'ChatStalled' },
+    )
+    if (reducer.result() !== '') failure.partialText = reducer.result()
+    throw failure
+  } finally {
+    clearTimeout(idleTimer)
   }
-  buffer += decoder.decode()
-  if (buffer.trim() !== '') dispatchSseBlock(buffer, (name, payload) => { reducer.push(name, payload) })
 
   if (reducer.failure() !== null) throw new AdpError(reducer.failure(), { code: 'ChatEventError' })
-  return { text: reducer.result(), requestId: body.RequestId, conversationId, transport: 'sse' }
+  return { text: reducer.result(), requestId: body.RequestId, conversationId, transport: 'sse', complete: true }
 }
 
 /**
@@ -1056,27 +1088,67 @@ export async function streamAdpChatWs(options) {
   const socket = new WebSocket(url.toString())
   const reducer = createChatReducer(onEvent)
   let settled = false
+  // A Claw-mode turn can legitimately run for minutes, so the guard is *liveness*, not
+  // wall-clock: the server pings every 25s, so any received frame proves the connection
+  // is alive and the agent is simply still working.
+  const idleTimeoutMs = options.idleTimeoutMs ?? 90000
+  const totalTimeoutMs = options.timeoutMs ?? 900000
 
   const outcome = await new Promise((resolve) => {
     let opened = false
     let completed = false
+    let idleTimer
+    let totalTimer
     const done = (error) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      clearTimeout(idleTimer)
+      clearTimeout(totalTimer)
       try { socket.close() } catch { /* already closing */ }
-      resolve(error === undefined ? { completed } : { error })
+      resolve(error === undefined ? { completed } : { error, partial: reducer.result() })
     }
-    const timer = setTimeout(() => done(new AdpError('WS 会话超时。', { code: 'ChatTimeout' })), options.timeoutMs ?? 180000)
+    /** Every inbound frame — including a heartbeat — resets the stall guard. */
+    const alive = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(
+        () => done(new AdpError(
+          `WS 会话已 ${Math.round(idleTimeoutMs / 1000)} 秒没有任何帧（含心跳），连接可能已失效。`,
+          { code: 'ChatStalled' },
+        )),
+        idleTimeoutMs,
+      )
+    }
+    totalTimer = setTimeout(
+      () => done(new AdpError(
+        `WS 会话超过 ${Math.round(totalTimeoutMs / 1000)} 秒仍未结束。`,
+        { code: 'ChatTimeout' },
+      )),
+      totalTimeoutMs,
+    )
+    alive()
     const abort = () => done(new AdpError('WS 会话已取消。', { code: 'ChatAborted' }))
     signal?.addEventListener('abort', abort, { once: true })
 
     socket.addEventListener('open', () => { opened = true })
     socket.addEventListener('error', () => done(new AdpError(`无法连接 WS 会话端点 ${url.host}。`, { code: 'ChatWsError' })))
-    socket.addEventListener('close', () => done(opened ? undefined : new AdpError(`WS 会话端点 ${url.host} 在握手阶段断开。`, { code: 'ChatWsClosed' })))
+    socket.addEventListener('close', (event) => {
+      if (!opened) {
+        done(new AdpError(`WS 会话端点 ${url.host} 在握手阶段断开。`, { code: 'ChatWsClosed' }))
+        return
+      }
+      // A close before `response.completed` is a real failure, not a silent success:
+      // keep whatever text arrived so the caller can still show it.
+      done(completed
+        ? undefined
+        : new AdpError(
+          `WS 连接在回复完成前被关闭（code=${event?.code ?? '?'}）。`,
+          { code: 'ChatWsClosed' },
+        ))
+    })
     socket.addEventListener('message', (event) => {
       const frame = typeof event.data === 'string' ? event.data : ''
       if (frame === '') return
+      alive()
       // Engine.IO open → authenticate with the Socket.IO connect packet.
       if (frame.startsWith('0')) {
         socket.send(`40${JSON.stringify({ token })}`)
@@ -1085,6 +1157,21 @@ export async function streamAdpChatWs(options) {
       // Engine.IO heartbeat; the connection is dropped without a reply.
       if (frame === '2') {
         socket.send('3')
+        return
+      }
+      // Engine.IO close / Socket.IO disconnect: fail now instead of waiting out a timer.
+      if (frame === '1' || frame === '41') {
+        done(completed ? undefined : new AdpError('WS 连接被服务端断开。', { code: 'ChatWsClosed' }))
+        return
+      }
+      // Socket.IO connect error (`44{...}`) — e.g. a rejected or expired handshake token.
+      if (frame.startsWith('44')) {
+        let detail = frame.slice(2)
+        try {
+          const parsed = JSON.parse(detail)
+          detail = parsed?.message ?? parsed?.data ?? detail
+        } catch { /* keep the raw text */ }
+        done(new AdpError(`WS 握手被拒：${detail}`, { code: 'ChatConnectError' }))
         return
       }
       if (frame.startsWith('40')) {
@@ -1125,9 +1212,14 @@ export async function streamAdpChatWs(options) {
 
   if (outcome.error !== undefined) {
     if (reducer.failure() !== null) throw new AdpError(reducer.failure(), { code: 'ChatEventError' })
+    // A partial answer is still worth reporting, so it rides along with the failure.
+    if (outcome.partial !== '') {
+      outcome.error.partialText = outcome.partial
+      outcome.error.conversationId = conversationId
+    }
     throw outcome.error
   }
-  return { text: reducer.result(), conversationId, transport: 'ws' }
+  return { text: reducer.result(), conversationId, transport: 'ws', complete: true }
 }
 
 /** Resolve the conversation id, opening one through the management API when absent. */
@@ -1374,6 +1466,8 @@ export function apply(ctx, config) {
       return settings.useSdk !== false && process.env.DSH_ADP_NO_SDK !== '1'
     },
     get requestTimeoutMs() { return settings.requestTimeoutMs },
+    get chatIdleTimeoutMs() { return settings.chatIdleTimeoutMs },
+    get chatTimeoutMs() { return settings.chatTimeoutMs },
     get apiVersion() { return settings.apiVersion },
   }
 
@@ -1402,6 +1496,8 @@ export function apply(ctx, config) {
       chatEndpoint: credentials.chatEndpoint,
       wsEndpoint: credentials.wsEndpoint,
       chatTransport: settings.chatTransport,
+      chatIdleTimeoutMs: settings.chatIdleTimeoutMs,
+      chatTimeoutMs: settings.chatTimeoutMs,
       statePath,
       chatEndpointHost: safeHost(credentials.chatEndpoint),
     }
@@ -1584,7 +1680,7 @@ export function apply(ctx, config) {
         required: ['appId', 'message'],
         additionalProperties: false,
       },
-      timeoutMs: 180000,
+      timeoutMs: settings.chatTimeoutMs,
       output: { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: renderChat(value) }] },
       async execute(args, exec) {
         await stateReady
@@ -1600,6 +1696,8 @@ export function apply(ctx, config) {
           transport: settings.chatTransport,
           endpoint: credentials.chatEndpoint,
           wsEndpoint: credentials.wsEndpoint,
+          idleTimeoutMs: settings.chatIdleTimeoutMs,
+          timeoutMs: settings.chatTimeoutMs,
           appKey,
           message,
           conversationId: normaliseId(input.conversationId),
@@ -1782,6 +1880,8 @@ export function apply(ctx, config) {
                 transport: settings.chatTransport,
                 endpoint: credentials.chatEndpoint,
                 wsEndpoint: credentials.wsEndpoint,
+                idleTimeoutMs: settings.chatIdleTimeoutMs,
+                timeoutMs: settings.chatTimeoutMs,
                 appKey,
                 message,
                 conversationId: normaliseId(body.conversationId),
@@ -1806,7 +1906,12 @@ export function apply(ctx, config) {
                 transport: result.transport,
               })
             } catch (error) {
-              write('console.error', { error: error instanceof Error ? error.message : String(error) })
+              write('console.error', {
+                error: error instanceof Error ? error.message : String(error),
+                code: error?.code,
+                // A stalled or closed turn may still hold a usable partial answer.
+                partialText: error?.partialText ?? '',
+              })
             }
             res.end()
             return

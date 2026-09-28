@@ -6,7 +6,7 @@
   "description": "Browse published Tencent Cloud ADP agent apps, publish or unpublish them, and chat with a published app over the ADP conversation API.",
   "icon": "./icon.svg",
   "exports": {
-    ".": "./lib/index.js",
+    ".": "./lib/entry.js",
     "./client": "./client.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"

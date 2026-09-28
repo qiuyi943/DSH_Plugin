@@ -24,7 +24,7 @@
 # `adp_list_spaces` tool) lists the real ids.
 - insert:
     - id: adp-console
-      name: './lib/index.js'
+      name: './lib/entry.js'
       config:
         site: standalone
         endpoint: capi.adp.tencent.com
