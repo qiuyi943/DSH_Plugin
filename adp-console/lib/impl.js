@@ -878,6 +878,53 @@ function extractFinalText(record, messageKinds = new Map()) {
   return out
 }
 
+/**
+ * Pull the human-in-the-loop pieces out of a final record.
+ *
+ * A Claw agent asks for input through the `AskUserQuestion` tool, and the platform
+ * delivers the answerable form as a reply whose `Contents` is a `questionnaire` — with
+ * **no text at all**. Rendering only text therefore loses the question entirely.
+ * `file` contents (produced artifacts) are collected the same way.
+ * @param record - a `message.done` message, or a `response.completed` response.
+ * @returns normalised interaction descriptors, in message order.
+ */
+function extractInteractions(record) {
+  if (record === null || typeof record !== 'object') return []
+  const messages = Array.isArray(record.Messages) ? record.Messages : [record]
+  const out = []
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue
+    if (message.Type === 'thought') continue
+    if (!Array.isArray(message.Contents)) continue
+    for (const content of message.Contents) {
+      if (content === null || typeof content !== 'object') continue
+      if (content.Type === 'questionnaire' && content.Questionnaire) {
+        const form = content.Questionnaire
+        const questions = (Array.isArray(form.Questions) ? form.Questions : []).map((question) => ({
+          index: question.Index ?? 0,
+          question: question.Question ?? '',
+          required: question.Required === true,
+          multiSelect: question.MultiSelect === true || question.Type === 2,
+          options: (Array.isArray(question.Options) ? question.Options : []).map(option => ({
+            label: option.Label ?? '',
+            description: option.Description ?? '',
+          })),
+        }))
+        if (questions.length > 0) {
+          out.push({ kind: 'questionnaire', title: form.Title ?? '', questions })
+        }
+      } else if (content.Type === 'file') {
+        out.push({
+          kind: 'file',
+          name: content.FileName ?? content.Name ?? '',
+          url: content.FileUrl ?? content.Url ?? '',
+        })
+      }
+    }
+  }
+  return out
+}
+
 /** The event's own name, from the SSE `event:` line or the payload's type field. */
 function eventName(sseEvent, payload) {
   if (sseEvent) return sseEvent
@@ -925,6 +972,8 @@ function createChatReducer(onEvent) {
   let delta = ''
   let authoritative = ''
   let failure = null
+  /** Structured, non-text content from the authoritative final record. */
+  let interactions = []
 
   const push = (name, payload) => {
     const isError = name === 'error' || name.endsWith('.error')
@@ -957,9 +1006,15 @@ function createChatReducer(onEvent) {
       // must not reach the delta sink or the caller would append the answer twice.
       const final = extractFinalText(payload?.Message, kinds)
       if (final !== '') authoritative = final
+      const found = extractInteractions(payload?.Message)
+      if (found.length > 0) interactions = found
     } else if (name === 'response.completed') {
       const final = extractFinalText(payload?.Response, kinds)
       if (final !== '') authoritative = final
+      // The completed response restates every message, so it is authoritative for
+      // structured content too.
+      const found = extractInteractions(payload?.Response)
+      if (found.length > 0) interactions = found
     }
     onEvent?.(name, payload, text)
     return { text, failure }
@@ -970,6 +1025,8 @@ function createChatReducer(onEvent) {
     failure: () => failure,
     /** `message.done` / `response.completed` restate the whole answer, so they win. */
     result: () => (authoritative !== '' ? authoritative : delta),
+    /** Questionnaires and files carried by the turn, ready for the panel to render. */
+    interactions: () => interactions,
   }
 }
 
@@ -1062,7 +1119,14 @@ export async function streamAdpChat(options) {
   }
 
   if (reducer.failure() !== null) throw new AdpError(reducer.failure(), { code: 'ChatEventError' })
-  return { text: reducer.result(), requestId: body.RequestId, conversationId, transport: 'sse', complete: true }
+  return {
+    text: reducer.result(),
+    requestId: body.RequestId,
+    conversationId,
+    transport: 'sse',
+    complete: true,
+    interactions: reducer.interactions(),
+  }
 }
 
 /**
@@ -1219,7 +1283,13 @@ export async function streamAdpChatWs(options) {
     }
     throw outcome.error
   }
-  return { text: reducer.result(), conversationId, transport: 'ws', complete: true }
+  return {
+    text: reducer.result(),
+    conversationId,
+    transport: 'ws',
+    complete: true,
+    interactions: reducer.interactions(),
+  }
 }
 
 /** Resolve the conversation id, opening one through the management API when absent. */
@@ -1904,6 +1974,9 @@ export function apply(ctx, config) {
                 text: result.text,
                 conversationId: result.conversationId,
                 transport: result.transport,
+                // Human-in-the-loop forms (and files) ride along so the panel can render
+                // them; a questionnaire turn can carry no text at all.
+                interactions: result.interactions ?? [],
               })
             } catch (error) {
               write('console.error', {

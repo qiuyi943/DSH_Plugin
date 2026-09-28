@@ -14,7 +14,7 @@
 | 应用清单 | 调用 ADP `DescribeAppSummaryList`，默认只列**已上线（已发布）**的应用，支持模糊搜索与状态筛选 |
 | 上架 / 下架 | 插件本地的 **DSH 调用开关**。上架 = 允许 DSH 通过 ADP 会话接口调用该应用；下架 = 禁止 |
 | 发布到 ADP | 对尚未成功发布的应用调用 `CreateRelease` 并轮询 `DescribeLatestRelease` 直到任务终态 |
-| 会话 | 对已上架的应用调用 ADP 会话接口（SSE 优先，查不到应用时自动回退 WebSocket），面板里流式显示回复；管理接口走官方 ADP SDK |
+| 会话 | 对已上架的应用调用 ADP 会话接口（SSE 优先，查不到应用时自动回退 WebSocket），面板里流式显示回复，并渲染 `questionnaire` 等人在回环组件；管理接口走官方 ADP SDK |
 | Agent 工具 | 向模型暴露 4 个工具，Agent 也能列清单、切换开关、发布、对话 |
 
 ### 关于「上架 / 下架」的准确语义
@@ -216,7 +216,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 95 项 | 通过 |
+| 自测 98 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -296,6 +296,32 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 人在回环组件（AskUserQuestion / questionnaire）
+
+Claw 智能体要用户确认时会调用 **`AskUserQuestion`** 工具，平台把可作答的表单作为一条
+**`Content.Type = "questionnaire"`** 的 reply 下发 —— 实测抓到的原文：
+
+```json
+{ "Type": "reply", "Contents": [{ "Type": "questionnaire", "Questionnaire": {
+  "Title": "插图方式",
+  "Questions": [{ "Index": 0, "Question": "PPT 中的插图希望采用哪种方式？", "Type": 1,
+    "Options": [{ "Label": "AI 生成插图（推荐）", "Description": "…" }] }] } }] }
+```
+
+**这条 reply 完全没有文本**。原实现只抽取 `Type: 'text'` 的内容，于是整个问题被丢掉，
+面板就停在上一句「需要确认插图方式：」——看起来像「展示不完整」，其实是组件没渲染。
+
+现在：
+
+- Host 侧 `extractInteractions()` 从权威的 `response.completed` / `message.done` 里抽取
+  `questionnaire`（标题、问题、必填、多选、选项 label+description）与 `file`（产出文件），
+  经 `console.done.interactions` 交给面板 —— 文本与组件**同时**返回，互不抢占。
+- 面板渲染成卡片：选项是可点的按钮（label + 灰色描述）。**点击即把该选项的 label 作为下一条
+  消息发出**——这是实测确认过的回答协议（Agent 收到 label 后继续干活，不会重新提问）。
+  多选（`multiSelect`）时先选中再点「确认」。
+- 事件列表也会显示工具调用的实际内容（`message.processing` 的 `Title`/`ToolName`），
+  长任务不再是清一色的 `task.modify`。
 
 ### 会话超时：改成「按存活性」判定，而不是总时长
 
@@ -387,7 +413,7 @@ Agent 还在干活，就不会被判定超时。
 `AppMode=4`(ClawAgent)、`AgentId` 只是 `CreateConversation` 入参、`CreateWebSocketToken` 的 Token 仅用于 WS 握手
 ——这些也已逐条排除。
 
-排障脚本：`node test/chatprobe.mjs <appId>`、`node test/appkey.mjs <appId> [--chat] [--dump]`、
+排障脚本：`node test/dump-events.mjs <appId> "消息" [会话ID]`（打印原始帧，用于确认内容类型）、`node test/chatprobe.mjs <appId>`、`node test/appkey.mjs <appId> [--chat] [--dump]`、
 `node test/spaces.mjs`、`node test/chat.mjs <appId>`、`node test/live-chat.mjs <appId>`（后者驱动插件真实路由）。
 
 ### 独立站与腾讯云站的差异（已确认）
@@ -427,7 +453,7 @@ Agent 还在干活，就不会被判定超时。
 | `package.json` | bundle 清单（`dsh.bundle.patch` + `dsh.client`），无任何运行时依赖 |
 | `cordis.patch.yml` | profile 里插入的那一行 |
 | `lib/entry.js` | bundle 入口（稳定壳）：每次激活用带 `?rev=` 的动态 import 加载实现，使改动无需重启即可生效 |
-| `lib/impl.js` | Host 半实现：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话与超时治理 |
+| `lib/impl.js` | Host 半实现：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话、超时治理与人在回环组件抽取 |
 | `client.js` | Client 半：侧边栏图标 + 主面板页面 + 流式会话 |
 | `locale/zh.json`、`locale/en.json` | 插件卡片的标题与描述 |
 | `icon.svg` | 侧边栏与插件卡片图标 |

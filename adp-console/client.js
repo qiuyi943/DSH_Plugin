@@ -256,11 +256,28 @@ window.__ModuleLoader__.load({
       '.adp-error{margin:0;padding:10px 12px;font-size:12px;color:var(--dsw-alias-state-error-primary)}',
       '.adp-chat{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}',
       '.adp-msgs{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}',
-      '.adp-msg{max-width:88%;padding:8px 10px;border-radius:10px;font-size:13px;white-space:pre-wrap;',
+      '.adp-msg{max-width:88%;padding:8px 10px;border-radius:10px;font-size:13px;',
       'word-break:break-word}',
       '.adp-msg.user{align-self:flex-end;background:var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary));',
       'color:var(--dsw-alias-label-primary-foreground)}',
       '.adp-msg.agent{align-self:flex-start;background:var(--dsw-alias-bg-layer-2)}',
+      '.adp-msgtext{white-space:pre-wrap}',
+      '.adp-card{margin-top:8px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
+      'background:var(--dsw-alias-bg-layer-1)}',
+      '.adp-cardtitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);margin-bottom:6px}',
+      '.adp-question{margin-bottom:6px}',
+      '.adp-questiontext{font-size:13px;margin-bottom:6px}',
+      '.adp-options{display:flex;flex-direction:column;gap:6px}',
+      '.adp-option{display:flex;flex-direction:column;gap:2px;text-align:left;cursor:pointer;',
+      'padding:7px 9px;border-radius:6px;font:inherit;border:1px solid var(--dsw-alias-border-l2);',
+      'background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
+      '.adp-option:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}',
+      '.adp-option:disabled{opacity:.5;cursor:default}',
+      '.adp-option.active{border-color:var(--dsw-alias-brand-primary)}',
+      '.adp-optionlabel{font-size:13px}',
+      '.adp-optiondesc{font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.adp-optionconfirm{align-self:flex-start;margin-top:6px}',
+      '.adp-filelink{font-size:11px;color:var(--dsw-alias-state-business-primary);word-break:break-all}',
       '.adp-msg.sys{align-self:center;font-size:12px;color:var(--dsw-alias-state-error-primary);background:none}',
       '.adp-compose{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l1);',
       'flex:0 0 auto;align-items:flex-end}',
@@ -436,6 +453,74 @@ window.__ModuleLoader__.load({
     }
 
     /** The right-hand conversation pane, streaming through the Host route. */
+    /**
+     * Render one structured interaction from an ADP turn.
+     *
+     * A Claw agent asks for input through `AskUserQuestion`, and the platform delivers
+     * the answerable form as a `questionnaire` content that carries no text at all — so
+     * without this the question is invisible. Choosing an option sends its label as the
+     * next message, which is how the platform expects the answer.
+     */
+    function renderInteraction(interaction, key, { busy, onChoose }) {
+      if (!interaction || typeof interaction !== 'object') return null;
+
+      if (interaction.kind === 'file') {
+        const parts = [h('div', { key: 'title', className: 'adp-cardtitle' },
+          interaction.name || '产出文件')];
+        if (interaction.url) {
+          parts.push(h('a', {
+            key: 'link', className: 'adp-filelink',
+            href: interaction.url, target: '_blank', rel: 'noreferrer',
+          }, interaction.url));
+        }
+        return h('div', { className: 'adp-card', key }, parts);
+      }
+
+      if (interaction.kind !== 'questionnaire') return null;
+      const [picked, setPicked] = useState({});
+      const questions = Array.isArray(interaction.questions) ? interaction.questions : [];
+
+      const questionNodes = questions.map((question) => {
+        const options = (Array.isArray(question.options) ? question.options : []).map(option => h('button', {
+          key: option.label,
+          type: 'button',
+          className: `adp-option${picked[question.index] === option.label ? ' active' : ''}`,
+          disabled: busy,
+          onClick: () => {
+            if (question.multiSelect) {
+              setPicked(previous => ({ ...previous, [question.index]: option.label }));
+              return;
+            }
+            onChoose(option.label);
+          },
+        },
+        h('span', { className: 'adp-optionlabel' }, option.label),
+        option.description ? h('span', { className: 'adp-optiondesc' }, option.description) : null));
+
+        const parts = [
+          h('div', { key: 'text', className: 'adp-questiontext' }, question.question),
+          h('div', { key: 'options', className: 'adp-options' }, options),
+        ];
+        if (question.multiSelect) {
+          parts.push(h('button', {
+            key: 'confirm',
+            type: 'button',
+            className: 'adp-btn primary adp-optionconfirm',
+            disabled: busy || !picked[question.index],
+            onClick: () => onChoose(picked[question.index]),
+          }, '确认'));
+        }
+        return h('div', { key: question.index, className: 'adp-question' }, parts);
+      });
+
+      const parts = [];
+      if (interaction.title) {
+        parts.push(h('div', { key: 'title', className: 'adp-cardtitle' }, interaction.title));
+      }
+      parts.push(...questionNodes);
+      return h('div', { className: 'adp-card', key }, parts);
+    }
+
     function ChatPane(props) {
       const { app, t } = props;
       const [messages, setMessages] = useState([]);
@@ -466,8 +551,8 @@ window.__ModuleLoader__.load({
       useEffect(() => { reset(); }, [app && app.appId, reset]);
       useEffect(() => () => { abortRef.current?.abort(); }, []);
 
-      const send = useCallback(async () => {
-        const text = draft.trim();
+      const send = useCallback(async (override) => {
+        const text = typeof override === 'string' ? override.trim() : draft.trim();
         if (text === '' || busy || !app) return;
         setDraft('');
         setBusy(true);
@@ -517,10 +602,18 @@ window.__ModuleLoader__.load({
               if (frame.name === 'console.done') {
                 const final = frame.data && typeof frame.data.text === 'string' ? frame.data.text : '';
                 if (frame.data && typeof frame.data.transport === 'string') setTransport(frame.data.transport);
+                // A human-in-the-loop turn can carry no text at all, only a form.
+                const interactions = frame.data && Array.isArray(frame.data.interactions)
+                  ? frame.data.interactions
+                  : [];
                 setMessages(previous => {
                   const next = previous.slice();
                   const last = next[next.length - 1];
-                  next[next.length - 1] = { role: 'agent', text: final !== '' ? final : last.text };
+                  next[next.length - 1] = {
+                    role: 'agent',
+                    text: final !== '' ? final : last.text,
+                    interactions: interactions.length > 0 ? interactions : undefined,
+                  };
                   return next;
                 });
                 continue;
@@ -532,7 +625,14 @@ window.__ModuleLoader__.load({
               }
               if (frame.name === 'adp.event') {
                 const name = frame.data && frame.data.name ? frame.data.name : '?';
-                setEvents(previous => [...previous.slice(-40), name]);
+                // Tool calls carry what the agent is actually doing; without it a long
+                // turn shows a wall of identical event names.
+                const message = frame.data && frame.data.payload && frame.data.payload.Message;
+                const tool = message && message.Type === 'tool_call'
+                  ? (message.Title || (message.ExtraInfo && message.ExtraInfo.ToolName) || '')
+                  : '';
+                const detail = tool !== '' ? `${name} · ${String(tool).slice(0, 80)}` : name;
+                setEvents(previous => [...previous.slice(-40), detail]);
               }
             }
           }
@@ -573,7 +673,12 @@ window.__ModuleLoader__.load({
                 : messages.map((message, index) => h('div', {
                   key: index,
                   className: `adp-msg ${message.role === 'user' ? 'user' : message.role === 'sys' ? 'sys' : 'agent'}`,
-                }, message.text === '' && busy && index === messages.length - 1 ? '…' : message.text)),
+                },
+                h('div', { className: 'adp-msgtext' },
+                  message.text === '' && busy && index === messages.length - 1 ? '…' : message.text),
+                (message.interactions || []).map((interaction, position) => renderInteraction(
+                  interaction, position, { busy, onChoose: label => void send(label) },
+                )))),
             ),
             h('div', { className: 'adp-compose' },
               h('textarea', {

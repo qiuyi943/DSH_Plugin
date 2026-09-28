@@ -164,7 +164,37 @@ function chatResponse(rawBody, res) {
   frame({ Type: 'message.added', MessageId: 'm2', Message: { Type: 'reply', MessageId: 'm2', Contents: [{ Type: 'text' }] } })
   frame({ Type: 'text.delta', MessageId: 'm2', Text: REPLY_TEXT.slice(0, 6) })
   frame({ Type: 'text.delta', MessageId: 'm2', Text: REPLY_TEXT.slice(6) })
-  frame({ Type: 'response.completed' })
+  // The completed frame restates every message; this is where a human-in-the-loop
+  // `questionnaire` content arrives. Shape taken verbatim from a live capture.
+  frame({
+    Type: 'response.completed',
+    Response: {
+      RecordId: 'r1',
+      Messages: [
+        { Type: 'reply', MessageId: 'm2', Contents: [{ Type: 'text', Text: REPLY_TEXT }] },
+        {
+          Type: 'reply',
+          MessageId: 'q1',
+          Contents: [{
+            Type: 'questionnaire',
+            Questionnaire: {
+              Title: '插图方式',
+              Questions: [{
+                Index: 0,
+                Question: 'PPT 中的插图希望采用哪种方式？',
+                Type: 1,
+                Required: false,
+                Options: [
+                  { Label: 'AI 生成插图（推荐）', Description: '为关键章节调用图像生成模型。' },
+                  { Label: '无插图', Description: '纯文字排版。' },
+                ],
+              }],
+            },
+          }],
+        },
+      ],
+    },
+  })
   res.write('event: done\ndata: [DONE]\n\n')
   res.end()
   // Echo the request so the test can assert the wire body shape.
@@ -1037,6 +1067,38 @@ check(
 check(
   'the entry answers through the registered route',
   (await entryHarness.call('GET', '/config')).json.ok === true,
+)
+
+/* --- 16. Human-in-the-loop content survives the turn --- */
+// A questionnaire reply carries no text, so a text-only reducer loses the question
+// entirely — the panel then looks truncated exactly where the agent asked something.
+const structured = await mod.runAdpChat({
+  transport: 'sse',
+  endpoint: `http://${origin}/adp/v2/chat`,
+  appKey: 'k',
+  message: '继续',
+  userId: 'u',
+  conversationId: 'c'.repeat(32),
+})
+check(
+  'a questionnaire is carried out of the turn',
+  Array.isArray(structured.interactions) && structured.interactions.length === 1,
+  JSON.stringify(structured.interactions),
+)
+const form = structured.interactions?.[0]
+check(
+  'the questionnaire keeps its title, question and options',
+  form?.kind === 'questionnaire'
+    && form.title === '插图方式'
+    && form.questions[0].question === 'PPT 中的插图希望采用哪种方式？'
+    && form.questions[0].options.length === 2
+    && form.questions[0].options[0].label === 'AI 生成插图（推荐）',
+  JSON.stringify(form),
+)
+check(
+  'the text answer is still returned alongside the form',
+  structured.text === REPLY_TEXT && structured.transport === 'sse',
+  JSON.stringify(structured.text),
 )
 
 gateway.close()
