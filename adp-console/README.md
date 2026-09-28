@@ -148,6 +148,14 @@ cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modu
 > （`button-primary-fill` / `label-primary-foreground` / `brand-primary` / `border-l3`），
 > **样式里不再有任何字面颜色**；自测里有一条守卫同时检查「无字面颜色」与「配对 token」。
 
+> **改 Host 代码后如何不重启就生效。** DSH 的 Loader 用 `await import(name)` 加载插件，没有
+> cache-busting，模块 URL 一旦加载就在进程内永久缓存 —— 所以 `set_bundle` 关→开只会重跑 `apply`，
+> 拿到的是**旧模块**；`install_bundle` 也会返回 `restart-required`。唯一的热加载办法是**让模块 URL 变化**：
+> 本插件的 patch 行因此写成**相对路径** `name: './lib/index.js'`（而不是包名 `@local/adp-console`），
+> Loader 走 `new URL(name, baseUrl)` 分支解析出文件 URL。改动后只需把入口文件挪到一个新路径
+> （或改行名指向新文件），再 `set_bundle` 关→开，新代际立即生效 —— 已实测，无需重启。
+> 入口保持相对路径还有一个好处：不必依赖 profile 的 node_modules 解析。
+
 > **冷启动必须用 `ctx.inject(['webServer'], …)` 注册路由**。最初这里写的是
 > `const webServer = ctx.get('webServer')`，一次性取值 —— 插件在冷启动时比 HTTP 载体先激活，
 > 于是 `webServer` 是 `undefined`，路由被**永久跳过**，面板就只剩 404（现象就是「访问不到 ADP」）。
@@ -392,7 +400,7 @@ WS 握手（按文档实现，Socket.IO v4）：
 | --- | --- |
 | `package.json` | bundle 清单（`dsh.bundle.patch` + `dsh.client`），无任何运行时依赖 |
 | `cordis.patch.yml` | profile 里插入的那一行 |
-| `index.js` | Host 半：TC3 签名、ADP OpenAPI 客户端、上架开关、4 个工具、浏览器路由、SSE 解析 |
+| `lib/index.js` | Host 半：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话 |
 | `client.js` | Client 半：侧边栏图标 + 主面板页面 + 流式会话 |
 | `locale/zh.json`、`locale/en.json` | 插件卡片的标题与描述 |
 | `icon.svg` | 侧边栏与插件卡片图标 |
@@ -400,5 +408,5 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 **注意**：Host 半刻意不 import 任何 Harness 包。工作区 bundle 无法解析
 `@deepseek-ai/*`（profile 的 `node_modules` 里只有你自己的包），所以本插件只用
-Node 内置模块；配置默认值在 `index.js` 的 `DEFAULT_CONFIG` 里，运行期需要用户调整的
+Node 内置模块；配置默认值在 `lib/index.js` 的 `DEFAULT_CONFIG` 里，运行期需要用户调整的
 东西都放在面板的「设置」里。

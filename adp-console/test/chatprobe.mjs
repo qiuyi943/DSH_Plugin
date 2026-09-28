@@ -11,7 +11,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SITES, buildTc3Headers } from '../index.js'
+import { SITES, buildTc3Headers } from '../lib/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const appId = process.argv[2]

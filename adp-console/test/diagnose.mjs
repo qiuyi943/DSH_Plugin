@@ -14,7 +14,7 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { SITES, verifyCredentials } from '../index.js'
+import { SITES, verifyCredentials } from '../lib/index.js'
 
 const statePath = process.argv[2]
   ?? join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'adp-console', 'state.json')

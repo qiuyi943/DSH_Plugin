@@ -291,7 +291,7 @@ const port = await new Promise((resolve) => {
 })
 const origin = `127.0.0.1:${port}`
 
-const mod = await import(pathToFileURL(join(here, '..', 'index.js')).href)
+const mod = await import(pathToFileURL(join(here, '..', 'lib', 'index.js')).href)
 
 /** The harness the main scenarios run against. */
 const primary = createHarness()
