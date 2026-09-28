@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# 依赖与构建产物
+node_modules/
+dist/
+*.log
+
+# 插件运行时状态（密钥等，永远不要提交）
+state.json
+*.tmp

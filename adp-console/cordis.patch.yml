@@ -1,0 +1,33 @@
+# ADP Console bundle: one Host row owning the ADP OpenAPI calls, the agent-facing
+# tools, and the browser route the Client panel talks to.
+#
+# `site` picks both the request domain and the key source:
+#   standalone → capi.adp.tencent.com        + ADP 控制台「密钥管理」
+#   cn         → adp.tencentcloudapi.com     + 腾讯云 CAM 控制台
+#   intl       → adp.intl.tencentcloudapi.com
+# A key exists on exactly one site, so the wrong site reports AuthFailure.SecretIdNotFound
+# (or 450203-ErrSecretNotFound on the standalone site).
+#
+# `endpoint` / `chatEndpoint` are the standing defaults. The panel's 站点 selector
+# overrides them; they are spelled out here because a Harness generation loaded before
+# that selector existed reads only these values.
+#
+# The standalone conversation stream is its own host and needs only the AppKey
+# (no V3 signature): https://cloud.tencent.com/document/product/1759/133869
+#
+# Credentials themselves come from the environment when this config leaves them empty
+# (TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY), and can also be saved from the
+# panel, which writes <DSH_HOME>/adp-console/state.json (mode 0600).
+# `spaceId` is the SpaceId the API expects, NOT the space name. On this standalone site
+# the only space is *named* `default_space` but its id is `bfnUUoSh`; passing the name
+# fails with `4510004-当前空间下没有该用户信息`. `node test/spaces.mjs` (or the
+# `adp_list_spaces` tool) lists the real ids.
+- insert:
+    - id: adp-console
+      name: '@local/adp-console'
+      config:
+        site: standalone
+        endpoint: capi.adp.tencent.com
+        chatEndpoint: https://adp.tencent.com/adp/v2/chat
+        region: ap-guangzhou
+        spaceId: bfnUUoSh
