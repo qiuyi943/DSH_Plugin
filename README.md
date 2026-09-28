@@ -22,6 +22,17 @@ plugin_manager install_bundle  target: <本仓库>/adp-console
 plugin_manager install_bundle  target: @local/adp-console
 ```
 
+### 依赖
+
+工作区 bundle 只能从**自身目录**解析依赖（`$DSH_PROFILE_DIR/node_modules` 不在 Node 的解析链上），
+所以插件的 npm 依赖要装在插件目录里，而不是靠 profile 的安装：
+
+```bash
+cd adp-console && pnpm install    # 装上 tencentcloud-sdk-nodejs-adp
+```
+
+不装也能跑 —— 插件会自动回退到内置的 TC3 签名，只是少了官方 SDK 的便利。
+
 ### 更新已安装的插件
 
 `install_bundle` 对已安装的包会返回 `restart-required`。用 bundle 的关→开可以强制重新组装：

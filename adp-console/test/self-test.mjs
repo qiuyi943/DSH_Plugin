@@ -11,6 +11,7 @@
 
 import { createServer } from 'node:http'
 import { mkdtemp, readFile, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -44,6 +45,7 @@ const REPLY_TEXT = '分析结果如下：本季度销售额环比增长 12%。'
 let lastAuthorization = ''
 let lastAction = ''
 let lastVersion = ''
+let lastRequestClient = null
 let lastPayload = null
 let lastConversationRequest = null
 
@@ -59,6 +61,7 @@ const gateway = createServer((req, res) => {
     lastAuthorization = req.headers.authorization ?? ''
     lastAction = req.headers['x-tc-action'] ?? ''
     lastVersion = req.headers['x-tc-version'] ?? ''
+    lastRequestClient = req.headers['x-tc-requestclient'] ?? null
     try {
       lastPayload = JSON.parse(raw)
     } catch {
@@ -857,6 +860,47 @@ check(
 check(
   'the toggle mirrors the host switch tokens',
   panelCss.includes('.adp-switch{') && panelCss.includes('--dsw-alias-border-l3'),
+)
+
+/* --- 13. Official SDK transport, with the built-in signer as fallback --- */
+// The SDK adds an `X-TC-RequestClient` header the plugin's own signer never sends, so
+// the mock can tell the two transports apart.
+check(
+  'the manifest declares the official ADP SDK',
+  /"tencentcloud-sdk-nodejs-adp"/.test(await readFile(join(here, '..', 'package.json'), 'utf8')),
+)
+
+const sdkHarness = createHarness()
+mod.apply(sdkHarness.ctx, {
+  secretId: 'AKIDsdk', secretKey: 'SECRETsdk', region: 'ap-guangzhou', spaceId: 'default_space',
+  site: 'standalone', endpoint: origin, chatEndpoint: '', wsEndpoint: '', protocol: 'http',
+  apiVersion: '2026-05-20', routePrefix: '/adp-console', statePath: join(stateDir, 'state-sdk.json'),
+  defaultEnabledAppIds: [], requestTimeoutMs: 10000, releaseTimeoutMs: 5000, appKeyCacheMs: 1000,
+  exposeTools: false, chatTransport: 'auto', useSdk: true,
+})
+const sdkListed = await sdkHarness.call('GET', '/apps?status=running')
+const viaSdk = lastRequestClient
+const sdkInstalled = existsSync(join(here, '..', 'node_modules', 'tencentcloud-sdk-nodejs-adp'))
+check(
+  'ADP calls go through the official SDK when it is installed',
+  !sdkInstalled || viaSdk !== null,
+  `installed=${sdkInstalled} · X-TC-RequestClient=${JSON.stringify(viaSdk)}`,
+)
+check('the SDK path returns the same catalogue', sdkListed.json.ok === true && sdkListed.json.apps[0].appId === APP_RUNNING)
+
+const httpHarness = createHarness()
+mod.apply(httpHarness.ctx, {
+  secretId: 'AKIDhttp', secretKey: 'SECRETh', region: 'ap-guangzhou', spaceId: 'default_space',
+  site: 'standalone', endpoint: origin, chatEndpoint: '', wsEndpoint: '', protocol: 'http',
+  apiVersion: '2026-05-20', routePrefix: '/adp-console', statePath: join(stateDir, 'state-http.json'),
+  defaultEnabledAppIds: [], requestTimeoutMs: 10000, releaseTimeoutMs: 5000, appKeyCacheMs: 1000,
+  exposeTools: false, chatTransport: 'auto', useSdk: false,
+})
+const httpListed = await httpHarness.call('GET', '/apps?status=running')
+check(
+  'useSdk:false falls back to the built-in TC3 signer',
+  lastRequestClient === null && httpListed.json.ok === true && lastVersion === '2026-05-20',
+  `X-TC-RequestClient=${JSON.stringify(lastRequestClient)} · X-TC-Version=${JSON.stringify(lastVersion)}`,
 )
 
 gateway.close()

@@ -70,8 +70,13 @@ export const DEFAULT_CONFIG = {
   releaseTimeoutMs: 90000,
   /** Cache lifetime for a resolved app AppKey. */
   appKeyCacheMs: 300000,
-  /** Register the four agent-facing tools. */
+  /** Register the agent-facing tools. */
   exposeTools: true,
+  /**
+   * Prefer the official `tencentcloud-sdk-nodejs-adp` for management calls.
+   * When it is not installed the plugin falls back to its built-in TC3 signer.
+   */
+  useSdk: true,
 }
 
 /**
@@ -308,6 +313,85 @@ export function describeApiError(prefix, error) {
   return `${prefix}: ${error.Code} — ${error.Message}${hint === undefined ? '' : `\n\n${hint}`}`
 }
 
+/* ------------------------------------------------------------------ *
+ * Official ADP SDK (tencentcloud-sdk-nodejs-adp)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The official Tencent Cloud ADP SDK, loaded lazily.
+ *
+ * The docs' quickstart installs the product SDK and lets it sign every management
+ * call (`pip install tencentcloud-sdk-python-adp` there; the Node twin here):
+ * https://cloud.tencent.com/document/product/1759/133869
+ *
+ * It is optional by design — a fresh checkout without `node_modules` still works
+ * through the built-in TC3 signer below — so the load never throws.
+ * @returns the `adp.v20260520.Client` constructor, or null when unavailable.
+ */
+let sdkConstructorPromise
+function loadAdpSdk(enabled) {
+  if (!enabled) return Promise.resolve(null)
+  if (sdkConstructorPromise === undefined) {
+    sdkConstructorPromise = import('tencentcloud-sdk-nodejs-adp')
+      .then((module) => {
+        const sdk = module.default ?? module
+        return sdk?.adp?.v20260520?.Client ?? null
+      })
+      .catch((error) => {
+        console.warn(`[adp-console] 官方 SDK 不可用，回退到内置 TC3 签名：${error.code ?? error.message}`)
+        return null
+      })
+  }
+  return sdkConstructorPromise
+}
+
+/** One SDK client per credential + endpoint combination. */
+const sdkClients = new Map()
+
+/** Get (or build) the SDK client for one target. */
+function sdkClientFor(SdkClient, target) {
+  const key = [target.secretId, target.region, target.endpoint, target.protocol].join('\n')
+  const cached = sdkClients.get(key)
+  if (cached !== undefined) return cached
+  const client = new SdkClient({
+    credential: { secretId: target.secretId, secretKey: target.secretKey },
+    region: target.region,
+    profile: {
+      httpProfile: {
+        endpoint: target.endpoint,
+        protocol: target.protocol === 'http' ? 'http:' : 'https:',
+        reqTimeout: Math.ceil((target.requestTimeoutMs ?? 20000) / 1000),
+      },
+    },
+  })
+  sdkClients.set(key, client)
+  return client
+}
+
+/** Drop cached clients so a credential change cannot reuse the old identity. */
+export function resetSdkClients() {
+  sdkClients.clear()
+}
+
+/** One action through the official SDK. */
+async function callViaSdk(SdkClient, target, action, params) {
+  const client = sdkClientFor(SdkClient, target)
+  const invoke = client[action]
+  if (typeof invoke !== 'function') {
+    throw new AdpError(`官方 SDK 没有 ${action} 接口。`, { code: 'SdkActionMissing', action })
+  }
+  try {
+    return await invoke.call(client, params)
+  } catch (error) {
+    // TencentCloudSDKError carries `.code` and `.message` from the API envelope.
+    const code = error?.code ?? 'SdkError'
+    throw new AdpError(
+      describeApiError(`ADP ${action} 调用失败`, { Code: code, Message: error?.message ?? String(error) }),
+      { code, action },
+    )
+  }
+}
+
 /** Signed call against an explicit endpoint; the shared transport for every action. */
 async function signedCall(target, action, params, signal) {
   if (!target.secretId || !target.secretKey) {
@@ -318,6 +402,17 @@ async function signedCall(target, action, params, signal) {
       { code: 'MissingCredentials', action },
     )
   }
+  // The official SDK is product-specific: only the `adp` actions exist on it. The
+  // identity probe (CVM) and any other product must use the built-in signer.
+  const SdkClient = target.service === 'adp' && target.useSdk !== false
+    ? await loadAdpSdk(true)
+    : null
+  if (SdkClient !== null) return callViaSdk(SdkClient, target, action, params)
+  return callViaHttp(target, action, params, signal)
+}
+
+/** Signed call built on the plugin's own TC3 implementation (SDK-free fallback). */
+async function callViaHttp(target, action, params, signal) {
   const timestamp = Math.floor(Date.now() / 1000)
   const { headers, body } = buildTc3Headers({
     secretId: target.secretId,
@@ -383,6 +478,8 @@ async function callAdp(credentials, action, params, signal) {
     apiVersion: credentials.apiVersion,
     region: credentials.region,
     service: 'adp',
+    useSdk: credentials.useSdk,
+    requestTimeoutMs: credentials.requestTimeoutMs,
   }, action, params, signal)
 }
 
@@ -648,6 +745,20 @@ async function describeLatestRelease(credentials, appId, signal) {
  * `Write`/`CreateRelease` returns a task id; the task's own status is polled through
  * `DescribeLatestRelease` because ADP exposes no per-task query by release id.
  */
+/**
+ * Read one release task by id.
+ * The walkthrough polls the exact task with `DescribeReleaseSummary`, which is more
+ * precise than the app's newest release:
+ * https://cloud.tencent.com/document/product/1759/133869 (步骤 5：发布应用)
+ */
+async function describeReleaseSummary(credentials, appId, releaseId, signal) {
+  const response = await callAdp(credentials, 'DescribeReleaseSummary', {
+    AppId: appId,
+    ReleaseId: releaseId,
+  }, signal)
+  return response.ReleaseSummary ?? null
+}
+
 async function publishApp(credentials, appId, options, signal) {
   const created = await createRelease(credentials, appId, options.description, signal)
   if (created.NeedApproval === true) {
@@ -659,10 +770,19 @@ async function publishApp(credentials, appId, options, signal) {
     }
   }
   const deadline = Date.now() + options.releaseTimeoutMs
-  let latest = null
+  let pollViaSummary = true
   while (Date.now() < deadline) {
-    latest = await describeLatestRelease(credentials, appId, signal)
-    const release = latest.release
+    let release = null
+    if (pollViaSummary) {
+      try {
+        release = await describeReleaseSummary(credentials, appId, created.ReleaseId, signal)
+      } catch (error) {
+        // An older deployment may not serve this action; fall back for later polls.
+        if (error?.code === 'InvalidAction' || error?.code === 'SdkActionMissing') pollViaSummary = false
+        else throw error
+      }
+    }
+    if (release === null) release = (await describeLatestRelease(credentials, appId, signal)).release
     if (release && String(release.ReleaseId) === String(created.ReleaseId) && typeof release.Status === 'number') {
       const known = RELEASE_STATUS[release.Status]
       if (known === undefined || known.terminal) {
@@ -1249,6 +1369,11 @@ export function apply(ctx, config) {
       return settings.wsEndpoint || SITES[activeSite()].wsEndpoint
     },
     get protocol() { return settings.protocol },
+    get useSdk() {
+      // `DSH_ADP_NO_SDK=1` forces the built-in signer, so the fallback stays testable.
+      return settings.useSdk !== false && process.env.DSH_ADP_NO_SDK !== '1'
+    },
+    get requestTimeoutMs() { return settings.requestTimeoutMs },
     get apiVersion() { return settings.apiVersion },
   }
 
@@ -1515,7 +1640,17 @@ export function apply(ctx, config) {
         try {
           if (req.method === 'GET' && route === '/config') {
             await stateReady
-            send(configView())
+            // Report which management transport is in force, so the panel can say
+            // whether the official SDK is actually in use.
+            const sdkConstructor = settings.useSdk === false ? null : await loadAdpSdk(true)
+            send({
+              ...configView(),
+              sdk: {
+                enabled: settings.useSdk !== false,
+                available: sdkConstructor !== null,
+                transport: settings.useSdk !== false && sdkConstructor !== null ? 'sdk' : 'builtin',
+              },
+            })
             return
           }
           if (req.method === 'POST' && route === '/config') {
@@ -1543,9 +1678,19 @@ export function apply(ctx, config) {
               throw new AdpError('SecretId 和 SecretKey 必须同时提供。', { code: 'InvalidArgs' })
             }
             await persist()
-            // A new key pair (or site) means every cached AppKey belongs to the old identity.
+            // A new key pair (or site) means every cached AppKey and SDK client belongs
+            // to the old identity.
             appKeyCache.clear()
-            send(configView())
+            resetSdkClients()
+            const sdkConstructor = settings.useSdk === false ? null : await loadAdpSdk(true)
+            send({
+              ...configView(),
+              sdk: {
+                enabled: settings.useSdk !== false,
+                available: sdkConstructor !== null,
+                transport: settings.useSdk !== false && sdkConstructor !== null ? 'sdk' : 'builtin',
+              },
+            })
             return
           }
           if (req.method === 'POST' && route === '/verify') {

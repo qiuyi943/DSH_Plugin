@@ -14,7 +14,7 @@
 | 应用清单 | 调用 ADP `DescribeAppSummaryList`，默认只列**已上线（已发布）**的应用，支持模糊搜索与状态筛选 |
 | 上架 / 下架 | 插件本地的 **DSH 调用开关**。上架 = 允许 DSH 通过 ADP 会话接口调用该应用；下架 = 禁止 |
 | 发布到 ADP | 对尚未成功发布的应用调用 `CreateRelease` 并轮询 `DescribeLatestRelease` 直到任务终态 |
-| 会话 | 对已上架的应用调用 ADP 会话接口（SSE 优先，查不到应用时自动回退 WebSocket），面板里流式显示回复 |
+| 会话 | 对已上架的应用调用 ADP 会话接口（SSE 优先，查不到应用时自动回退 WebSocket），面板里流式显示回复；管理接口走官方 ADP SDK |
 | Agent 工具 | 向模型暴露 4 个工具，Agent 也能列清单、切换开关、发布、对话 |
 
 ### 关于「上架 / 下架」的准确语义
@@ -102,6 +102,36 @@ client = adp_adp_client.AdpClient(cred, "ap-guangzhou", profile)
 
 ---
 
+## 4.5 官方 SDK
+
+按[从零搭建](https://cloud.tencent.com/document/product/1759/133869)第 2 步「安装 ADP 专属 SDK」，
+管理接口改由官方 SDK 承担，插件不再自己拼签名：
+
+```bash
+cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modules 不入库
+```
+
+- 插件跑在 **Node 宿主**里，对应的是 Node 版 `tencentcloud-sdk-nodejs-adp`（文档给的是 Python 版
+  `tencentcloud-sdk-python-adp`）。
+- 一处工程约束：**工作区 bundle 只能从自身目录解析依赖**（`$DSH_PROFILE_DIR/node_modules` 不在
+  Node 的解析链上），所以 SDK 必须装在插件目录内，装完 `adp-console/node_modules` 约 3.7 MB（已 gitignore）。
+- SDK 只覆盖**管理接口**（`DescribeAppSummaryList` / `DescribeApp` / `CreateConversation` /
+  `CreateWebSocketToken` / `CreateRelease` / `DescribeReleaseSummary` …）。**对话流不是 SDK 能力**，
+  仍走 HTTP SSE / Socket.IO —— 与文档一致，文档里对话也是用 `requests` + `sseclient` 发的。
+- 发布轮询已按文档改用 `DescribeReleaseSummary(AppId, ReleaseId)` 查**指定任务**，
+  该 action 不可用时回退 `DescribeLatestRelease`。
+- **SDK 是产品专属的**：`adp` 以外的调用（凭据体检里的 CVM 身份核对）仍走内置签名器。
+- **没装也能跑**：`import('tencentcloud-sdk-nodejs-adp')` 失败时自动回退到插件内置的 TC3 签名，
+  只是少了 SDK 的便利。`useSdk: false`（config）或 `DSH_ADP_NO_SDK=1`（环境变量）可强制内置签名。
+- 面板「设置」底部会显示当前生效的是**官方 ADP SDK** 还是**内置 TC3 签名**。
+
+实测（真实应用，两条链路都通，均已拿到真实回复）：
+
+```
+官方 SDK      → 完整回复 "OK" · 通道 ws · 6.5s
+内置签名回退  → 完整回复 "OK" · 通道 ws · 3.2s
+```
+
 ## 5. 浏览器通道
 
 > **主题 token 必须成对使用。** 面板最初的用户气泡和主按钮写的是
@@ -177,7 +207,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 83 项 | 通过 |
+| 自测 87 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -324,7 +354,7 @@ WS 握手（按文档实现，Socket.IO v4）：
 ——这些也已逐条排除。
 
 排障脚本：`node test/chatprobe.mjs <appId>`、`node test/appkey.mjs <appId> [--chat] [--dump]`、
-`node test/spaces.mjs`。
+`node test/spaces.mjs`、`node test/chat.mjs <appId>`、`node test/live-chat.mjs <appId>`（后者驱动插件真实路由）。
 
 ### 独立站与腾讯云站的差异（已确认）
 
