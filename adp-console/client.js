@@ -106,6 +106,8 @@ window.__ModuleLoader__.load({
       agent: '智能体',
       copyId: '复制 ID',
       copied: '已复制',
+      transportLabel: '传输：{mode}',
+      dshCallableCopy: '等待首次对话',
       total: '共 {n} 个应用',
       enabledCount: '已上架 {n} 个',
       mentionSection: 'ADP 智能体',
@@ -198,6 +200,8 @@ window.__ModuleLoader__.load({
       agent: 'Agent',
       copyId: 'Copy id',
       copied: 'Copied',
+      transportLabel: 'Transport: {mode}',
+      dshCallableCopy: 'No turn yet',
       total: '{n} apps',
       enabledCount: '{n} enabled',
       mentionSection: 'ADP agents',
@@ -229,7 +233,8 @@ window.__ModuleLoader__.load({
       '.adp-btn:disabled{opacity:.5;cursor:default}',
       '.adp-btn.primary{color:var(--dsw-alias-label-primary-foreground);',
       'background:var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary));border-color:transparent}',
-      '.adp-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,420px);gap:14px;',
+      '.adp-body{display:grid;grid-template-columns:minmax(260px,320px) minmax(0,1fr);gap:14px;',
+      'align-items:start}',
       'flex:1 1 auto;min-height:0}',
       '@media (max-width:900px){.adp-body{grid-template-columns:minmax(0,1fr)}}',
       '.adp-card{display:flex;flex-direction:column;min-height:0;overflow:hidden;',
@@ -237,8 +242,14 @@ window.__ModuleLoader__.load({
       '.adp-cardhead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;',
       'border-bottom:1px solid var(--dsw-alias-border-l1);font-size:13px;font-weight:600;flex:0 0 auto}',
       '.adp-list{overflow-y:auto;min-height:0;flex:1 1 auto}',
-      '.adp-row{display:flex;align-items:center;gap:12px;padding:10px 12px;',
+      '.adp-headmain{display:flex;align-items:center;gap:6px;min-width:0}',
+      '.adp-headname{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.adp-headmeta{display:flex;gap:10px;padding:6px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);',
+      'font-size:11px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}',
+      '.adp-headmeta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.adp-row{display:flex;align-items:center;flex-wrap:nowrap;gap:10px;padding:9px 12px;',
       'border-bottom:1px solid var(--dsw-alias-border-l1);cursor:pointer}',
+      '.adp-tags{flex-wrap:nowrap;overflow:hidden}',
       '.adp-row:last-child{border-bottom:none}',
       '.adp-row:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.adp-row.sel{background:var(--dsw-alias-bg-layer-2)}',
@@ -311,19 +322,24 @@ window.__ModuleLoader__.load({
       'max-width:min(30vw,320px)}',
       '.adp-md-table th:first-child,.adp-md-table td:first-child{padding-left:0}',
       // Turn timeline rows, mirroring the Host's reasoning/tool rows.
-      '.adp-row{display:flex;flex-direction:column;margin:6px 0}',
+      // Process rows are deliberately quiet: the answer is the content, the steps are
+      // supporting detail. The Host dims reasoning to label-tertiary and tool rows to
+      // label-secondary for the same reason.
+      '.adp-row{display:flex;flex-direction:column;margin:2px 0}',
       '.adp-rowhead{display:flex;align-items:center;gap:6px;width:100%;min-width:0;padding:0;border:0;',
       'background:none;font:inherit;text-align:left;cursor:pointer;color:var(--dsw-alias-label-tertiary);',
-      'font-size:var(--dsh-content-font-size-secondary,13px);line-height:24px}',
+      'font-size:var(--dsh-content-font-size-secondary,13px);line-height:22px}',
       '.adp-rowhead:disabled{cursor:default}',
-      '.adp-row.tool .adp-rowhead{color:var(--dsw-alias-label-primary)}',
-      '.adp-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-business-primary)}',
-      '.adp-row.running .adp-dot{animation:adp-pulse 1.2s ease-in-out infinite}',
+      '.adp-row.tool .adp-rowhead{color:var(--dsw-alias-label-secondary)}',
+      '.adp-row.tool .adp-rowlabel{font-weight:500}',
+      '.adp-dot{flex:none;width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-label-caption)}',
+      '.adp-row.running .adp-dot{background:var(--dsw-alias-state-business-primary);',
+      'animation:adp-pulse 1.2s ease-in-out infinite}',
       '@keyframes adp-pulse{0%,100%{opacity:1}50%{opacity:.35}}',
-      '.adp-caret{flex:none;width:12px;color:var(--dsw-alias-label-caption)}',
-      '.adp-rowlabel{flex:none;font-weight:500}',
+      '.adp-caret{flex:none;width:10px;color:var(--dsw-alias-label-caption)}',
+      '.adp-rowlabel{flex:none;font-weight:400}',
       '.adp-rowsummary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
-      'color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px)}',
+      'color:var(--dsw-alias-label-caption);font-size:var(--dsh-content-font-size-secondary,13px)}',
       '.adp-rowbody{margin:4px 0 2px 18px;padding:8px 10px;border-radius:var(--dsw-radius-sm,8px);',
       'background:var(--dsw-alias-bg-layer-2);border:0.5px solid var(--dsw-alias-border-l1);',
       'max-height:280px;overflow:auto;display:flex;flex-direction:column;gap:6px}',
@@ -487,10 +503,9 @@ window.__ModuleLoader__.load({
             `${app.appId}${app.appModeLabel ? ` · ${app.appModeLabel.zh}` : ''}`),
         ),
         h('div', { className: 'adp-tags' },
+          // The switch states the gate itself, so the row keeps only the ADP status and
+          // leaves the name room to read in a narrow column.
           h('span', { className: `adp-pill ${statusKey}` }, statusText),
-          app.dshEnabled
-            ? h('span', { className: 'adp-pill on' }, t('gateOn'))
-            : h('span', { className: 'adp-pill off' }, t('gateOff')),
           unpublished
             ? h('button', {
               className: 'adp-btn',
@@ -698,6 +713,36 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * A readable summary of a tool invocation.
+     *
+     * The ADP `Title` for a tool call is the raw invocation, e.g.
+     * `TaskCreate({"activeForm":"调研 AI Agent 定义","status":"pending"})`. Showing that
+     * verbatim buries the one useful field in punctuation, so the arguments are parsed and
+     * the most descriptive value is surfaced (the Host shows a human summary, not the raw
+     * arguments).
+     */
+    function toolSummary(title) {
+      if (typeof title !== 'string' || title === '') return '';
+      const call = /^[\w.]*\s*\(([\s\S]*)\)\s*$/.exec(title);
+      if (call === null) return title.slice(0, 90);
+      let args = null;
+      try {
+        args = JSON.parse(call[1]);
+      } catch {
+        return call[1].replace(/\s+/g, ' ').trim().slice(0, 90);
+      }
+      if (args === null || typeof args !== 'object') return String(args).slice(0, 90);
+      const preferred = ['query', 'activeForm', 'description', 'command', 'prompt', 'subject',
+        'path', 'file_path', 'status', 'name'];
+      for (const key of preferred) {
+        const value = args[key];
+        if (typeof value === 'string' && value.trim() !== '') return value.trim().slice(0, 90);
+      }
+      const first = Object.values(args).find(value => typeof value === 'string' && value.trim() !== '');
+      return typeof first === 'string' ? first.trim().slice(0, 90) : '';
+    }
+
+    /**
      * One reasoning step, mirroring the Host's disclosure row: a 24px dim line that
      * expands to the raw thinking.
      */
@@ -713,7 +758,7 @@ window.__ModuleLoader__.load({
           onClick: () => setOpen(value => !value),
         },
         h('span', { className: 'adp-caret' }, open ? '▾' : '▸'),
-        h('span', { className: 'adp-rowlabel' }, entry.name || '思考'),
+        h('span', { className: 'adp-rowlabel' }, entry.title || entry.name || '思考'),
         running ? h('span', { className: 'adp-sweep' }) : null),
         open
           ? h('div', { className: 'adp-rowbody' }, h(Markdown, { text: entry.text, className: 'adp-md-dim' }))
@@ -728,7 +773,7 @@ window.__ModuleLoader__.load({
       // `tool` is the machine tool (bash/write/read), `title` the concrete invocation,
       // `name` the platform's label — the Host shows exactly this split.
       const name = entry.tool || entry.name || '工具';
-      const detail = entry.title && entry.title !== name ? entry.title : '';
+      const detail = toolSummary(entry.title);
       const hasBody = entry.text !== '' || (entry.files || []).length > 0;
       return h('div', { className: `adp-row tool${running ? ' running' : ''}` },
         h('button', {
@@ -765,7 +810,7 @@ window.__ModuleLoader__.load({
         if (entry.kind === 'tool') return h(ToolRow, { key: entry.id, entry });
         if (entry.kind === 'task') {
           return h('div', { key: entry.id, className: 'adp-row task' },
-            h('span', { className: 'adp-rowlabel' }, entry.title || entry.name || entry.text || '任务'));
+            h('span', { className: 'adp-rowlabel' }, toolSummary(entry.title) || entry.name || entry.text || '任务'));
         }
         if (entry.kind === 'answer') {
           return entry.text === ''
@@ -1062,15 +1107,27 @@ window.__ModuleLoader__.load({
       }
 
       const blocked = !app.dshEnabled;
+      const appStatusKey = ADP_STATUS_KEY[app.adpStatus];
       return h('section', { className: 'adp-card' },
         h('div', { className: 'adp-cardhead' },
-          h('span', null, app.name || t('chat')),
+          h('div', { className: 'adp-headmain' },
+            h('span', { className: 'adp-headname', title: app.name }, app.name || t('chat')),
+            h('span', { className: `adp-pill ${app.adpStatus === 2 ? 'on' : 'off'}` },
+              appStatusKey === undefined ? '—' : t(appStatusKey)),
+            app.dshEnabled
+              ? h('span', { className: 'adp-pill on' }, t('gateOn'))
+              : h('span', { className: 'adp-pill off' }, t('gateOff')),
+          ),
           h('button', {
             className: 'adp-btn',
             type: 'button',
             onClick: reset,
             disabled: busy && messages.length === 0,
           }, t('newConversation')),
+        ),
+        h('div', { className: 'adp-headmeta' },
+          app.appModeLabel ? h('span', null, app.appModeLabel.zh) : null,
+          h('span', null, `${t('conversation')}: ${conversationId || '—'}`),
         ),
         blocked
           ? h('p', { className: 'adp-note' }, t('chatBlocked'))
@@ -1134,7 +1191,7 @@ window.__ModuleLoader__.load({
           )
           : null,
         h('div', { className: 'adp-foot' },
-          h('span', null, `${t('conversation')}: ${conversationId || '—'}${transport === '' ? '' : ` · ${transport.toUpperCase()}`}`),
+          h('span', null, transport === '' ? t('dshCallableCopy') : t('transportLabel', { mode: transport.toUpperCase() })),
           h('span', null, blocked ? t('dshBlocked') : t('dshCallable')),
         ),
       );

@@ -274,7 +274,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 172 项 | 通过 |
+| 自测 179 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -357,6 +357,36 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 页面布局：对话是主体，过程被弱化
+
+三处调整：
+
+**① 左栏收窄。** 原来网格是 `minmax(0,1fr) minmax(320px,420px)` —— 列表占 `1fr` 撑满、
+对话被压到 320–420px，正好搞反了。现在列表是固定窄列、对话占满剩余：
+
+```css
+.adp-body{grid-template-columns:minmax(260px,320px) minmax(0,1fr)}
+```
+
+列表只是**选择器**，所以每行不再重复开关已经表达的状态（去掉了与 switch 冗余的
+「已上架/已下架」标签），名称在窄列里也能读全。
+
+**② 核心信息集中到右栏头部。** 应用名 + ADP 状态 + 能否被 DSH 调用 + 模式 + 会话号，
+一眼看全；底部只留传输方式与可调用状态。
+
+**③ 过程结果弱化**（对齐 DSH 的层次）：
+
+| 元素 | 处理 |
+| --- | --- |
+| 思考行 | `label-tertiary`、22px 行高、状态点 5px |
+| 工具行 | `label-secondary`（不再是 `label-primary`） |
+| 正文 | 正常字号 + `label-primary`，与过程行之间留白 |
+| 工具调用 | `TaskCreate({"activeForm":"调研 AI Agent 定义",…})` → **调研 AI Agent 定义** |
+
+最后一条很重要：ADP 的工具 `Title` 是**原始调用**，直接显示等于把有用信息埋进标点里。
+现在解析参数并挑出最有描述性的字段（`query` / `activeForm` / `description` / `command` …），
+解析失败就退化成可读文本，并截断到 90 字符。
 
 ### 按 ADP 协议解析整个回合，实时展示
 

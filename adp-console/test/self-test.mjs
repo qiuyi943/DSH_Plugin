@@ -1757,6 +1757,55 @@ check(
     .every(patch => patch.append.length <= 4000),
 )
 
+/* --- 21. Panel layout: the conversation is the main column --- */
+// The grid was inverted: the app list took `1fr` and squeezed the conversation into
+// 320-420px. The list is a selector, so it is the narrow column.
+check(
+  'the conversation pane is the flexible column and the list is narrow',
+  /\.adp-body\{display:grid;grid-template-columns:minmax\(260px,320px\) minmax\(0,1fr\)/.test(panelCss),
+  (/\.adp-body\{[^}]*/.exec(panelCss) ?? [''])[0].slice(0, 120),
+)
+// Process rows carry the steps; the answer carries the content. The host dims reasoning
+// to label-tertiary and tool rows to label-secondary for exactly this reason.
+check(
+  'process rows are visually weakened against the answer',
+  /\.adp-rowhead\{display:flex[^}]*color:var\(--dsw-alias-label-tertiary\)/.test(panelCss)
+    && /\.adp-row\.tool \.adp-rowhead\{color:var\(--dsw-alias-label-secondary\)\}/.test(panelCss),
+  (/\.adp-rowhead\{[^}]*/.exec(panelCss) ?? [''])[0].slice(0, 160),
+)
+check(
+  'the row shows only the ADP status beside the gate switch, not both',
+  (() => {
+    const at = clientSource.indexOf("h('div', { className: 'adp-tags' }")
+    const row = clientSource.slice(at, clientSource.indexOf("h('button', {", at))
+    return at > 0 && row.includes('adp-pill ${statusKey}') && !row.includes("t('gateOn')")
+  })(),
+)
+
+/* --- 22. Tool invocations are summarised, not dumped as raw arguments --- */
+const summaryStart = clientSource.indexOf('    function toolSummary(title) {')
+const summaryEnd = clientSource.indexOf('    /**', summaryStart)
+const toolSummary = new Function(`${clientSource.slice(summaryStart, summaryEnd)} return toolSummary;`)()
+check(
+  'a JSON tool invocation surfaces its most descriptive field',
+  toolSummary('TaskCreate({"activeForm": "调研 AI Agent 定义", "status": "pending"})') === '调研 AI Agent 定义'
+    && toolSummary('websearch({"query": "AI agent market size 2025"})') === 'AI agent market size 2025'
+    && toolSummary('TaskUpdate({"status": "in_progress", "taskId": "1"})') === 'in_progress',
+)
+check(
+  'a plain call keeps its arguments',
+  toolSummary('bash(ls -la /workdir)') === 'ls -la /workdir' && toolSummary('') === '',
+)
+check(
+  'malformed arguments degrade to readable text instead of throwing',
+  toolSummary('TaskCreate({not json at all})') === '{not json at all}',
+  toolSummary('TaskCreate({not json at all})'),
+)
+check(
+  'a long summary is truncated',
+  toolSummary(`websearch({"query": "${'x'.repeat(200)}"})`).length === 90,
+)
+
 gateway.close()
 
 /* ------------------------------------------------------------------ *
