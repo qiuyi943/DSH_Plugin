@@ -161,6 +161,36 @@ function chatResponse(rawBody, res) {
   const frame = payload => res.write(`data: ${JSON.stringify(payload)}\n\n`)
   frame({ Type: 'request_ack', RequestId: body?.RequestId })
   frame({ Type: 'response.created', RecordId: 'r1' })
+  // The exact lifecycle captured from the live endpoint: 思考 → 回复 → 工具.
+  if (body?.Contents?.[0]?.Text === 'TIMELINE') {
+    frame({ Type: 'message.added', MessageId: 't1', Message: { Type: 'thought', MessageId: 't1', Name: 'thought', Title: '思考', Status: 'processing', Contents: [{ Type: 'text' }] } })
+    frame({ Type: 'content.added', MessageId: 't1', ContentIndex: 0, Content: { Type: 'text' } })
+    frame({ Type: 'text.delta', MessageId: 't1', Text: '先看看目录。' })
+    frame({ Type: 'message.done', MessageId: 't1', Message: { Type: 'thought', MessageId: 't1', Status: 'success', Contents: [{ Type: 'text', Text: '先看看目录。' }] } })
+    frame({ Type: 'message.added', MessageId: 'r1', Message: { Type: 'reply', MessageId: 'r1', Name: 'reply', Contents: [{ Type: 'text' }] } })
+    frame({ Type: 'text.delta', MessageId: 'r1', Text: '我先看一下工作目录。' })
+    frame({ Type: 'message.done', MessageId: 'r1', Message: { Type: 'reply', MessageId: 'r1', Status: 'success', Contents: [{ Type: 'text', Text: '我先看一下工作目录。' }] } })
+    frame({ Type: 'message.added', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Name: '执行命令', ExtraInfo: { ToolName: 'bash' }, Contents: [{ Type: 'json_text' }] } })
+    frame({ Type: 'message.processing', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Title: 'ls -la /workdir', Status: 'processing', ExtraInfo: { ToolName: 'bash', Elapsed: '7101' } } })
+    frame({ Type: 'text.replace', MessageId: 'c1', Text: 'total 16\ndrwxr-xr-x 2 root root' })
+    frame({ Type: 'content.added', MessageId: 'c1', ContentIndex: 1, Content: { Type: 'file', FileName: 'out.txt', FileUrl: 'https://example.com/out.txt' } })
+    frame({ Type: 'message.done', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Status: 'success', Contents: [{ Type: 'json_text' }] } })
+    frame({
+      Type: 'response.completed',
+      Response: {
+        RecordId: 'r1',
+        Messages: [
+          { Type: 'thought', MessageId: 't1', Contents: [{ Type: 'text', Text: '先看看目录。' }] },
+          { Type: 'reply', MessageId: 'r1', Contents: [{ Type: 'text', Text: '我先看一下工作目录。' }] },
+          { Type: 'tool_call', MessageId: 'c1', Name: '执行命令', ExtraInfo: { ToolName: 'bash' }, Contents: [{ Type: 'file', FileName: 'out.txt', FileUrl: 'https://example.com/out.txt' }] },
+        ],
+      },
+    })
+    res.write('event: done\ndata: [DONE]\n\n')
+    res.end()
+    globalThis.__lastChatBody = body
+    return
+  }
   // A Claw agent narrates each step as its own reply; two of them must not be glued.
   if (body?.Contents?.[0]?.Text === 'MULTI') {
     frame({ Type: 'message.added', MessageId: 's1', Message: { Type: 'reply', MessageId: 's1', Contents: [{ Type: 'text' }] } })
@@ -1664,6 +1694,67 @@ check(
 check(
   'the paragraph break from separate replies survives rendering',
   md.blockNodes('第一批资料已获取。\n\n继续搜索。', 'k').length === 2,
+)
+
+/* --- 20. The turn timeline follows the ADP message protocol --- */
+// A turn is 思考 → 回复 → 工具, each its own message. Only the reply used to survive, so
+// the panel sat blank while the agent worked.
+const entryPatches = []
+const timelineTurn = await mod.runAdpChat({
+  transport: 'sse',
+  endpoint: `http://${origin}/adp/v2/chat`,
+  appKey: 'k',
+  message: 'TIMELINE',
+  userId: 'u',
+  conversationId: 'c'.repeat(32),
+  onEvent: (name, payload, text, patch) => { if (patch) entryPatches.push(patch) },
+})
+const kinds = (timelineTurn.timeline || []).map(entry => entry.kind)
+check(
+  'every message kind keeps its own timeline entry, in protocol order',
+  JSON.stringify(kinds) === JSON.stringify(['reasoning', 'answer', 'tool']),
+  JSON.stringify(kinds),
+)
+check(
+  'reasoning is no longer discarded',
+  timelineTurn.timeline[0].text === '先看看目录。' && timelineTurn.timeline[0].status === 'done',
+  JSON.stringify(timelineTurn.timeline[0]),
+)
+check(
+  'the tool entry carries its name, invocation and output',
+  (() => {
+    const tool = timelineTurn.timeline[2]
+    return tool.tool === 'bash' && tool.title === 'ls -la /workdir'
+      && tool.text === 'total 16\ndrwxr-xr-x 2 root root' && tool.status === 'done'
+  })(),
+  JSON.stringify(timelineTurn.timeline[2]),
+)
+check(
+  'a file produced by a tool rides on its entry',
+  timelineTurn.timeline[2].files?.[0]?.name === 'out.txt',
+  JSON.stringify(timelineTurn.timeline[2].files),
+)
+check(
+  'only the answer counts as the turn text',
+  timelineTurn.text === '我先看一下工作目录。',
+  JSON.stringify(timelineTurn.text),
+)
+check(
+  'entries stream as they happen, not only at the end',
+  entryPatches.some(patch => patch.kind === 'reasoning')
+    && entryPatches.some(patch => patch.kind === 'tool')
+    && entryPatches.findIndex(patch => patch.kind === 'reasoning')
+       < entryPatches.findIndex(patch => patch.kind === 'tool'),
+  `patches=${entryPatches.length}`,
+)
+check(
+  'the panel is told about the tool invocation while it runs',
+  entryPatches.some(patch => patch.id === 'c1' && patch.title === 'ls -la /workdir' && patch.status === 'running'),
+)
+check(
+  'reasoning patches are capped so a long thought cannot flood the stream',
+  entryPatches.filter(patch => patch.id === 't1' && typeof patch.append === 'string')
+    .every(patch => patch.append.length <= 4000),
 )
 
 gateway.close()

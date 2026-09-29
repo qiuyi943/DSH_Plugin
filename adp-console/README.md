@@ -274,7 +274,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 164 项 | 通过 |
+| 自测 172 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -357,6 +357,60 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 按 ADP 协议解析整个回合，实时展示
+
+一个回合**不是一条消息**。抓到的真实生命周期：
+
+```
+  683ms  request_ack
+ 1056ms  response.created
+ 6231ms  ADD  Type=thought   Name=思考            ← 思考
+ 7263ms  ADD  Type=reply     Name=reply           ← 回复
+ 7450ms  ADD  Type=tool_call Name=执行命令 Tool=bash
+ 7591ms  PROC               Title="ls -la /workdir" ← 运行中才有具体命令
+ 8119ms  REPL               len=150                 ← 工具输出
+ 8120ms  DONE               Status=success
+10121ms  ADD  Type=thought   …（下一步）
+```
+
+原来的 reducer 只认 `reply`，`thought` 直接丢弃、`tool_call` 只进事件列表 —— 于是面板在
+Agent 干活的那几秒里**只有一个「…」**。实测：改之前首条可见文本在 **+6536ms**，
+而 `adp.event` 从 +695ms 就一直在发。
+
+现在按协议把每条消息变成时间线上的一条 entry（`reasoning` / `answer` / `tool` / `task`），
+边收边推：
+
+| 协议帧 | 时间线动作 |
+| --- | --- |
+| `message.added` | 新建 entry（按 `Message.Type` 定 kind，取 `ExtraInfo.ToolName`） |
+| `message.processing` | 补上**具体调用**（`Title` = 命令行/文件名），状态 running |
+| `content.added` | `file` 类型挂到该 entry 上（工具产出的文件） |
+| `text.delta` / `text.replace` | 追加 / 替换该 entry 的文本（工具输出走 replace） |
+| `message.done` | 置为 done |
+| `response.completed` | **权威重建**整条时间线 |
+
+两个实现要点：
+
+- **入口用结构化补丁而非整段文本**：`console.entry` 只发变化（`append` / `text` / `status`），
+  面板按 `MessageId` 合并。思考文本可能几万字符，所以只在 4000 字符内流式发送
+  （面板本来就是折叠显示）。
+- **权威重建不丢实时信息**：`response.completed` 会重述所有消息，但「具体调用命令」
+  只存在于 `message.processing`、工具输出只存在于 `text.replace`，重建时必须与增量结果
+  合并保留。另外 `json_text` 只在 `tool_call` 消息里算工具输出，在 `reply` 里是内部
+  噪声、不能混进正文。
+
+界面按 DSH 桌面端的 transcript 组织：**思考**折叠行（24px、13px、`label-tertiary`，
+运行时状态点脉冲）、**工具**行（状态点 + 工具名 + 具体调用，可展开看输出与产出文件）、
+然后是**正文** Markdown。
+
+实测（真实应用）：
+
+```
+改前：首条可见文本 +6536ms
+改后：首个 entry +4113ms（思考），随后 tool 行 +4463ms → title 补全 +4670ms
+      一次回合内 reasoning 6 · answer 65 · tool 9 条 entry 补丁
+```
 
 ### 对话内容按 DSH 的方式渲染
 

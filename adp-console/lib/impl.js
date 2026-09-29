@@ -877,32 +877,6 @@ function extractDeltaText(payload) {
  * `message.done` holds `Message.Contents[]`, `response.completed` holds `Response.Messages[]`.
  * Any message the stream already labelled `thought` is excluded.
  */
-function extractFinalParts(record, messageKinds = new Map()) {
-  const out = new Map()
-  if (record === null || typeof record !== 'object') return out
-  const messages = Array.isArray(record.Messages) ? record.Messages : [record]
-  for (const message of messages) {
-    if (message === null || typeof message !== 'object') continue
-    if (messageKinds.get(message.MessageId) === 'thought' || message.MessageType === 'thought') continue
-    if (message.Type === 'thought') continue
-    if (!Array.isArray(message.Contents)) continue
-    let text = ''
-    for (const content of message.Contents) {
-      if (content && typeof content === 'object' && content.Type === 'text' && typeof content.Text === 'string') {
-        text += content.Text
-      }
-    }
-    // A message with no text (a questionnaire, a file) contributes no paragraph.
-    if (text !== '') {
-      const key = typeof message.MessageId === 'string' && message.MessageId !== ''
-        ? message.MessageId
-        : `#${out.size}`
-      out.set(key, text)
-    }
-  }
-  return out
-}
-
 /**
  * Pull the human-in-the-loop pieces out of a final record.
  *
@@ -995,90 +969,250 @@ function createChatReducer(onEvent) {
   /** MessageId → the kind declared by `message.added`. */
   const kinds = new Map()
   /**
-   * Reply text per message id, in arrival order.
+   * The turn as an ordered timeline, not one blob.
    *
-   * One turn is not one message: a Claw agent narrates each step as its own `reply`
-   * ("第一批资料已获取。", "继续搜索验证关键数据与产品信息。", …). Concatenating them
-   * produced a single run-on paragraph, so each message keeps its own part and the parts
-   * are joined with a blank line.
+   * The ADP protocol narrates a turn as a sequence of messages: a `thought`, a `reply`,
+   * a `tool_call` (with `message.processing` while it runs and a `text.replace` carrying
+   * its output), then the next `thought`/`reply` pair. Discarding the non-reply messages
+   * left the panel blank for many seconds while the agent worked, so every message keeps
+   * its own entry and each is streamed as it happens.
    */
-  const parts = new Map()
-  let authoritativeParts = null
+  const entries = new Map()
+  let order = []
   let failure = null
   /** Structured, non-text content from the authoritative final record. */
   let interactions = []
 
   const keyOf = (payload) => {
     const id = payload?.MessageId
-    return typeof id === 'string' && id !== '' ? id : ''
+    return typeof id === 'string' && id !== '' ? id : `anon-${order.length}`
   }
-  const append = (key, text) => {
-    const previous = parts.get(key)
-    parts.set(key, previous === undefined ? text : previous + text)
-    return previous === undefined
+  const kindOfMessage = (message) => {
+    const type = message?.Type
+    if (type === 'thought') return 'reasoning'
+    if (type === 'reply') return 'answer'
+    if (type === 'tool_call') return 'tool'
+    if (type === 'task' || type === 'question') return 'task'
+    return 'notice'
   }
-  const join = (map) => [...map.values()].filter(part => part !== '').join('\n\n')
+  const upsert = (id, patch) => {
+    let entry = entries.get(id)
+    if (entry === undefined) {
+      entry = { id, kind: 'notice', name: '', title: '', tool: '', status: 'running', text: '', files: [] }
+      entries.set(id, entry)
+      order.push(id)
+    }
+    Object.assign(entry, patch)
+    return entry
+  }
+  const timeline = () => order.map(id => entries.get(id)).filter(entry => entry !== undefined)
 
   const push = (name, payload) => {
     const isError = name === 'error' || name.endsWith('.error')
       || (payload !== null && typeof payload === 'object' && payload.Error !== undefined)
-    let text = ''
     if (isError) {
       failure = eventError(payload)
-    } else if (name === 'message.added') {
-      const id = payload?.MessageId
-      const kind = addedMessageKind(payload)
-      if (typeof id === 'string' && kind !== undefined) kinds.set(id, kind)
-    } else if (name === 'text.delta') {
-      const chunk = extractDeltaText(payload)
-      const kind = kinds.get(payload?.MessageId)
-      // Reasoning (`thought`) frames are not part of the answer.
-      if (chunk !== '' && (kind === undefined || kind === 'reply')) {
-        const key = keyOf(payload)
-        const isNewPart = append(key, chunk)
-        // A new message starts a paragraph, so the separator rides the first delta and
-        // the panel — which appends deltas — shows the break while it streams.
-        const separator = isNewPart && parts.size > 1 ? '\n\n' : ''
-        text = separator + chunk
+      onEvent?.(name, payload, '', null)
+      return { text: '', failure }
+    }
+
+    /** Flat answer text for this frame; the completion frame also carries the whole answer. */
+    let text = ''
+    /** Timeline patch for the panel, or null when this frame changes nothing visible. */
+    let patch = null
+
+    if (name === 'message.added') {
+      const id = keyOf(payload)
+      const message = payload?.Message
+      // `kinds` keeps the raw ADP type (the delta branch filters on `thought`/`reply`);
+      // entries and patches always carry the normalised kind the panel switches on.
+      const rawKind = addedMessageKind(payload)
+      if (typeof payload?.MessageId === 'string' && rawKind !== undefined) kinds.set(payload.MessageId, rawKind)
+      const entry = upsert(id, {
+        kind: kindOfMessage(message),
+        name: message?.Name ?? '',
+        title: message?.Title ?? '',
+        tool: message?.ExtraInfo?.ToolName ?? '',
+        status: 'running',
+      })
+      patch = { id, kind: entry.kind, name: entry.name, title: entry.title, tool: entry.tool, status: 'running' }
+    } else if (name === 'message.processing') {
+      // `Title` here is the concrete invocation: the command line, the target file.
+      const id = keyOf(payload)
+      const message = payload?.Message
+      const entry = upsert(id, {
+        kind: kindOfMessage(message),
+        // `Title` on a processing frame is the concrete invocation.
+        title: message?.Title || '',
+        tool: message?.ExtraInfo?.ToolName ?? '',
+        status: 'running',
+      })
+      patch = { id, kind: entry.kind, name: entry.name, title: entry.title, tool: entry.tool, status: 'running' }
+    } else if (name === 'content.added') {
+      const content = payload?.Content
+      if (content?.Type === 'file') {
+        const id = keyOf(payload)
+        const entry = upsert(id, {})
+        const file = { name: content.FileName ?? content.Name ?? '', url: content.FileUrl ?? content.Url ?? '' }
+        if (!entry.files.some(existing => existing.url === file.url)) entry.files.push(file)
+        patch = { id, files: entry.files }
       }
-    } else if (name === 'text.replace') {
-      // A replace frame restates one message's whole text; it is not an append.
-      const chunk = extractDeltaText(payload)
+    } else if (name === 'text.delta' || name === 'text.replace') {
+      const id = keyOf(payload)
       const kind = kinds.get(payload?.MessageId)
-      if (kind === undefined || kind === 'reply') {
-        const key = keyOf(payload)
-        const isNewPart = !parts.has(key)
-        parts.set(key, chunk)
-        const separator = isNewPart && parts.size > 1 ? '\n\n' : ''
+      const chunk = extractDeltaText(payload)
+      const reasonKind = kind === 'thought' ? 'reasoning' : kind === 'tool_call' ? 'tool' : null
+      if (reasonKind !== null) {
+        const entry = upsert(id, { kind: reasonKind })
+        if (name === 'text.replace') entry.text = chunk
+        else entry.text += chunk
+        // Reasoning is rendered collapsed and can reach tens of KB, so only its head is
+        // streamed; tool output is kept whole because it is short and worth reading.
+        if (reasonKind === 'reasoning') {
+          if (name === 'text.replace') {
+            patch = { id, text: chunk.slice(0, REASONING_LIMIT) }
+          } else if (entry.text.length <= REASONING_LIMIT) {
+            patch = { id, append: chunk }
+          }
+        } else {
+          patch = name === 'text.replace' ? { id, text: chunk } : { id, append: chunk }
+        }
+      } else if (kind === undefined || kind === 'reply') {
+        // `message.added` already created the entry, so "first text for this message" is
+        // what starts a paragraph — not "entry missing".
+        const isNewAnswer = (entries.get(id)?.text ?? '') === ''
+        const entry = upsert(id, { kind: 'answer' })
+        if (name === 'text.replace') entry.text = chunk
+        else entry.text += chunk
+        // One turn narrates through several `reply` messages. The timeline keeps them as
+        // separate entries, and the flat stream keeps a blank line between them so both
+        // representations of the turn agree.
+        const separator = isNewAnswer && timeline().some(other => other.kind === 'answer' && other.id !== id && other.text !== '')
+          ? '\n\n'
+          : ''
         text = separator + chunk
+        patch = name === 'text.replace'
+          ? { id, kind: 'answer', text: chunk }
+          : { id, kind: 'answer', append: chunk }
       }
     } else if (name === 'message.done') {
-      // Completion frames restate the whole answer; they are not incremental, so they
-      // must not reach the delta sink or the caller would append the answer twice.
-      const final = extractFinalParts(payload?.Message, kinds)
-      if (final.size > 0) authoritativeParts = final
+      const id = keyOf(payload)
+      const message = payload?.Message
+      const entry = upsert(id, { status: 'done' })
+      if (typeof message?.Title === 'string' && message.Title !== '') entry.title = message.Title
+      patch = { id, status: 'done', title: entry.title }
       const found = extractInteractions(payload?.Message)
       if (found.length > 0) interactions = found
     } else if (name === 'response.completed') {
-      const final = extractFinalParts(payload?.Response, kinds)
-      if (final.size > 0) authoritativeParts = final
-      // The completed response restates every message, so it is authoritative for
-      // structured content too.
+      // The completed response restates every message, so it is authoritative: rebuild
+      // the timeline from it instead of trusting the incremental stream.
+      const rebuilt = rebuildTimeline(payload?.Response)
+      if (rebuilt.order.length > 0) {
+        // Copy first: `entries.clear()` would otherwise empty the very map we read from.
+        const previous = new Map(entries)
+        entries.clear()
+        order = [...rebuilt.order]
+        for (const [id, entry] of rebuilt.entries) {
+          const before = previous.get(id)
+          if (before !== undefined) {
+            // The completed record restates structure and final state, but the concrete
+            // invocation and live output exist only on the incremental frames.
+            if (entry.title === '') entry.title = before.title
+            if (entry.text === '') entry.text = before.text
+            if (entry.files.length === 0) entry.files = before.files
+            if (entry.tool === '') entry.tool = before.tool
+          }
+          entries.set(id, entry)
+        }
+        for (const id of order) {
+          const entry = entries.get(id)
+          onEvent?.(`entry.${entry.kind}`, payload, '', { ...entry, replace: true })
+        }
+      }
       const found = extractInteractions(payload?.Response)
       if (found.length > 0) interactions = found
     }
-    onEvent?.(name, payload, text)
+
+    onEvent?.(name, payload, text, patch)
     return { text, failure }
   }
+
+  const answerText = () => timeline()
+    .filter(entry => entry.kind === 'answer')
+    .map(entry => entry.text)
+    .filter(value => value !== '')
+    .join('\n\n')
 
   return {
     push,
     failure: () => failure,
-    /** `message.done` / `response.completed` restate the whole answer, so they win. */
-    result: () => (authoritativeParts !== null ? join(authoritativeParts) : join(parts)),
-    /** Questionnaires and files carried by the turn, ready for the panel to render. */
+    /** Every visible part of the turn, in protocol order. */
+    timeline,
+    /** The answer alone, which is what the completion frame reports. */
+    result: answerText,
+    /** Questionnaires and files carried by the turn. */
     interactions: () => interactions,
   }
+}
+
+/** Reasoning can be tens of KB per step; the panel shows it collapsed. */
+const REASONING_LIMIT = 4000
+
+/** Rebuild the whole timeline from a `response.completed` payload. */
+function rebuildTimeline(record) {
+  const entries = new Map()
+  const order = []
+  if (record === null || typeof record !== 'object') return { entries, order }
+  const messages = Array.isArray(record.Messages) ? record.Messages : [record]
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue
+    let kind = 'notice'
+    if (message.Type === 'thought') kind = 'reasoning'
+    else if (message.Type === 'reply') kind = 'answer'
+    else if (message.Type === 'tool_call') kind = 'tool'
+    else if (message.Type === 'task' || message.Type === 'question') kind = 'task'
+    let text = ''
+    const files = []
+    for (const content of Array.isArray(message.Contents) ? message.Contents : []) {
+      if (content === null || typeof content !== 'object') continue
+      if (content.Type === 'text' && typeof content.Text === 'string') text += content.Text
+      // On a tool message the `json_text` content is the tool's own output; on a reply it
+      // is internal chatter and must not reach the prose.
+      if (kind === 'tool' && content.Type === 'json_text' && typeof content.Text === 'string') text += content.Text
+      if (content.Type === 'file') {
+        files.push({ name: content.FileName ?? content.Name ?? '', url: content.FileUrl ?? content.Url ?? '' })
+      }
+    }
+    if (kind === 'reasoning') text = text.slice(0, REASONING_LIMIT)
+    if (text === '' && files.length === 0 && kind === 'notice') continue
+    const id = typeof message.MessageId === 'string' && message.MessageId !== ''
+      ? message.MessageId
+      : `#${order.length}`
+    entries.set(id, {
+      id,
+      kind,
+      name: message.Name ?? '',
+      // Never fall back to `Name`: the concrete invocation would be lost when the
+      // completion frame restates the message.
+      title: message.Title ?? '',
+      tool: message.ExtraInfo?.ToolName ?? '',
+      status: 'done',
+      text,
+      files,
+    })
+    order.push(id)
+  }
+  return { entries, order }
+}
+
+/** A short, human-readable label for the panel's event list. */
+function eventLabel(name, payload) {
+  const message = payload?.Message
+  const title = typeof message?.Title === 'string' ? message.Title : ''
+  if (title !== '') return `${name} · ${title.slice(0, 80)}`
+  const tool = message?.ExtraInfo?.ToolName
+  if (typeof tool === 'string' && tool !== '') return `${name} · ${tool}`
+  return name
 }
 
 /** Whether an error means the conversation service cannot resolve the app. */
@@ -1177,6 +1311,7 @@ export async function streamAdpChat(options) {
     transport: 'sse',
     complete: true,
     interactions: reducer.interactions(),
+    timeline: reducer.timeline(),
   }
 }
 
@@ -1340,6 +1475,7 @@ export async function streamAdpChatWs(options) {
     transport: 'ws',
     complete: true,
     interactions: reducer.interactions(),
+    timeline: reducer.timeline(),
   }
 }
 
@@ -2440,9 +2576,12 @@ export function apply(ctx, config) {
                 conversationId: normaliseId(body.conversationId),
                 userId,
                 signal,
-                onEvent: (name, payload, text) => {
+                onEvent: (name, payload, text, patch) => {
+                  // One frame can carry all three: a timeline patch, the flat answer delta,
+                  // and the raw event for the panel's event list.
+                  if (patch) write('console.entry', patch)
                   if (text) write('console.delta', { text })
-                  write('adp.event', { name, payload: serialisable(payload) })
+                  write('adp.event', { name, label: eventLabel(name, payload) })
                 },
                 openConversation: async () => {
                   const created = await createApiConversation(credentials, appId, appKey, userId, signal)
@@ -2460,6 +2599,9 @@ export function apply(ctx, config) {
                 // Human-in-the-loop forms (and files) ride along so the panel can render
                 // them; a questionnaire turn can carry no text at all.
                 interactions: result.interactions ?? [],
+                // The authoritative turn timeline, so the panel can reconcile anything it
+                // assembled from the incremental patches.
+                timeline: result.timeline ?? [],
               })
             } catch (error) {
               write('console.error', {

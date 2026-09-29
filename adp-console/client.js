@@ -310,6 +310,25 @@ window.__ModuleLoader__.load({
       '.adp-md-table td{padding:10px 16px;border-bottom:0.5px solid var(--dsw-alias-border-l2);',
       'max-width:min(30vw,320px)}',
       '.adp-md-table th:first-child,.adp-md-table td:first-child{padding-left:0}',
+      // Turn timeline rows, mirroring the Host's reasoning/tool rows.
+      '.adp-row{display:flex;flex-direction:column;margin:6px 0}',
+      '.adp-rowhead{display:flex;align-items:center;gap:6px;width:100%;min-width:0;padding:0;border:0;',
+      'background:none;font:inherit;text-align:left;cursor:pointer;color:var(--dsw-alias-label-tertiary);',
+      'font-size:var(--dsh-content-font-size-secondary,13px);line-height:24px}',
+      '.adp-rowhead:disabled{cursor:default}',
+      '.adp-row.tool .adp-rowhead{color:var(--dsw-alias-label-primary)}',
+      '.adp-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-business-primary)}',
+      '.adp-row.running .adp-dot{animation:adp-pulse 1.2s ease-in-out infinite}',
+      '@keyframes adp-pulse{0%,100%{opacity:1}50%{opacity:.35}}',
+      '.adp-caret{flex:none;width:12px;color:var(--dsw-alias-label-caption)}',
+      '.adp-rowlabel{flex:none;font-weight:500}',
+      '.adp-rowsummary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+      'color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px)}',
+      '.adp-rowbody{margin:4px 0 2px 18px;padding:8px 10px;border-radius:var(--dsw-radius-sm,8px);',
+      'background:var(--dsw-alias-bg-layer-2);border:0.5px solid var(--dsw-alias-border-l1);',
+      'max-height:280px;overflow:auto;display:flex;flex-direction:column;gap:6px}',
+      '.adp-md-dim{color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px)}',
+      '.adp-row.notice{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
       '.adp-card{margin-top:8px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
       'background:var(--dsw-alias-bg-layer-1)}',
       '.adp-cardtitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);margin-bottom:6px}',
@@ -679,6 +698,87 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * One reasoning step, mirroring the Host's disclosure row: a 24px dim line that
+     * expands to the raw thinking.
+     */
+    function ReasoningRow(props) {
+      const { entry } = props;
+      const [open, setOpen] = useState(false);
+      const running = entry.status === 'running';
+      return h('div', { className: `adp-row${running ? ' running' : ''}` },
+        h('button', {
+          type: 'button',
+          className: 'adp-rowhead',
+          'aria-expanded': open ? 'true' : 'false',
+          onClick: () => setOpen(value => !value),
+        },
+        h('span', { className: 'adp-caret' }, open ? '▾' : '▸'),
+        h('span', { className: 'adp-rowlabel' }, entry.name || '思考'),
+        running ? h('span', { className: 'adp-sweep' }) : null),
+        open
+          ? h('div', { className: 'adp-rowbody' }, h(Markdown, { text: entry.text, className: 'adp-md-dim' }))
+          : null);
+    }
+
+    /** One tool invocation: name plus the concrete call, expandable to its output. */
+    function ToolRow(props) {
+      const { entry } = props;
+      const [open, setOpen] = useState(false);
+      const running = entry.status === 'running';
+      // `tool` is the machine tool (bash/write/read), `title` the concrete invocation,
+      // `name` the platform's label — the Host shows exactly this split.
+      const name = entry.tool || entry.name || '工具';
+      const detail = entry.title && entry.title !== name ? entry.title : '';
+      const hasBody = entry.text !== '' || (entry.files || []).length > 0;
+      return h('div', { className: `adp-row tool${running ? ' running' : ''}` },
+        h('button', {
+          type: 'button',
+          className: 'adp-rowhead',
+          'aria-expanded': open ? 'true' : 'false',
+          disabled: !hasBody,
+          onClick: () => setOpen(value => !value),
+        },
+        h('span', { className: 'adp-dot' }),
+        h('span', { className: 'adp-rowlabel' }, name),
+        detail !== '' ? h('span', { className: 'adp-rowsummary' }, detail) : null,
+        hasBody ? h('span', { className: 'adp-caret' }, open ? '▾' : '▸') : null),
+        open
+          ? h('div', { className: 'adp-rowbody' },
+            entry.text !== ''
+              ? h('pre', { className: 'adp-md-pre' }, h('code', null, entry.text))
+              : null,
+            (entry.files || []).map((file, position) => h('a', {
+              key: position,
+              className: 'adp-filelink',
+              href: file.url,
+              target: '_blank',
+              rel: 'noreferrer',
+            }, file.name || file.url)))
+          : null);
+    }
+
+    /** Render one turn as the protocol ordered it. */
+    function TurnTimeline(props) {
+      const { entries, busy } = props;
+      return entries.map((entry) => {
+        if (entry.kind === 'reasoning') return h(ReasoningRow, { key: entry.id, entry });
+        if (entry.kind === 'tool') return h(ToolRow, { key: entry.id, entry });
+        if (entry.kind === 'task') {
+          return h('div', { key: entry.id, className: 'adp-row task' },
+            h('span', { className: 'adp-rowlabel' }, entry.title || entry.name || entry.text || '任务'));
+        }
+        if (entry.kind === 'answer') {
+          return entry.text === ''
+            ? null
+            : h(Markdown, { key: entry.id, text: entry.text });
+        }
+        return entry.text === ''
+          ? null
+          : h('div', { key: entry.id, className: 'adp-row notice' }, entry.text);
+      });
+    }
+
+    /**
      * Render one structured interaction from an ADP turn.
      *
      * A Claw agent asks for input through `AskUserQuestion`, and the platform delivers
@@ -862,6 +962,33 @@ window.__ModuleLoader__.load({
                 if (frame.data && frame.data.conversationId) setConversationId(frame.data.conversationId);
                 continue;
               }
+              if (frame.name === 'console.entry') {
+                // The Host streams the turn as patches keyed by ADP MessageId; merge each
+                // into the running turn's timeline.
+                const patch = frame.data;
+                if (patch && typeof patch.id === 'string') {
+                  setMessages(previous => {
+                    const next = previous.slice();
+                    const last = next[next.length - 1];
+                    const entries = (last.entries || []).slice();
+                    const at = entries.findIndex(item => item.id === patch.id);
+                    const base = at >= 0 ? entries[at] : {
+                      id: patch.id, kind: 'notice', name: '', title: '', tool: '',
+                      status: 'running', text: '', files: [],
+                    };
+                    const merged = { ...base };
+                    for (const key of ['kind', 'name', 'title', 'tool', 'status', 'files']) {
+                      if (patch[key] !== undefined) merged[key] = patch[key];
+                    }
+                    if (typeof patch.text === 'string') merged.text = patch.text;
+                    else if (typeof patch.append === 'string') merged.text = (merged.text || '') + patch.append;
+                    if (at >= 0) entries[at] = merged; else entries.push(merged);
+                    next[next.length - 1] = { ...last, entries };
+                    return next;
+                  });
+                }
+                continue;
+              }
               if (frame.name === 'console.delta') {
                 const delta = frame.data && frame.data.text ? frame.data.text : '';
                 if (delta !== '') {
@@ -881,12 +1008,18 @@ window.__ModuleLoader__.load({
                 const interactions = frame.data && Array.isArray(frame.data.interactions)
                   ? frame.data.interactions
                   : [];
+                // The completion frame restates the whole turn, so it wins over anything
+                // assembled from the incremental patches.
+                const timeline = frame.data && Array.isArray(frame.data.timeline) && frame.data.timeline.length > 0
+                  ? frame.data.timeline
+                  : null;
                 setMessages(previous => {
                   const next = previous.slice();
                   const last = next[next.length - 1];
                   next[next.length - 1] = {
                     role: 'agent',
                     text: final !== '' ? final : last.text,
+                    entries: timeline ?? last.entries,
                     interactions: interactions.length > 0 ? interactions : undefined,
                   };
                   return next;
@@ -954,11 +1087,16 @@ window.__ModuleLoader__.load({
                   // while the assistant turn is full-width prose, not a second bubble.
                   return h('div', { key: index, className: `adp-msg ${role}` },
                     h('div', { className: 'adp-bubble' },
-                      pending
-                        ? h('div', { className: 'adp-md' }, '…')
-                        : role === 'agent'
-                          ? h(Markdown, { text: message.text })
-                          : h('div', { className: 'adp-msgtext' }, message.text),
+                      (() => {
+                        if (role !== 'agent') return h('div', { className: 'adp-msgtext' }, message.text);
+                        if (pending) return h('div', { className: 'adp-md' }, '…');
+                        const entries = message.entries || [];
+                        // The timeline is the protocol order (思考 → 回复 → 工具 → …); the
+                        // flat text is only a fallback for turns that carried no messages.
+                        return entries.length > 0
+                          ? h(TurnTimeline, { entries, busy })
+                          : h(Markdown, { text: message.text });
+                      })(),
                       interactions));
                 }),
             ),
