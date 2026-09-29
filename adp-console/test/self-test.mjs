@@ -930,14 +930,24 @@ check(
   !/(?:^|[^-])(?:color|background|border-color)\s*:\s*(?:#|rgba?\(|hsla?\()/i.test(panelCss),
   (panelCss.match(/(?:color|background|border-color)\s*:\s*(?:#|rgba?\()[^;}]*/gi) ?? []).join(' | ').slice(0, 200),
 )
+// Rule-scoped rather than element-scoped: any declaration block that paints a brand
+// fill must pair it with the theme's foreground token, whatever the selector is.
+// Only rules that paint BOTH a brand fill and a text colour need the pairing: a switch
+// track carries no text (its foreground is the `.adp-knob`, asserted below), exactly as
+// the Host's own `.switch` / `.thumb` pair does.
+const brandFillTextRules = panelCss
+  .split('}')
+  .filter(rule => /background:[^;]*(?:brand-primary|button-primary-fill)/.test(rule))
+  .filter(rule => /[^-]color:/.test(rule))
 check(
   'text on a brand fill uses the paired foreground token',
-  ['.adp-btn.primary', '.adp-msg.user', '.adp-knob'].every((selector) => {
-    const at = panelCss.indexOf(selector)
-    if (at < 0) return false
-    const rule = panelCss.slice(at, panelCss.indexOf('}', at))
-    return rule.includes('label-primary-foreground')
-  }),
+  brandFillTextRules.length > 0
+    && brandFillTextRules.every(rule => rule.includes('label-primary-foreground')),
+  brandFillTextRules.filter(rule => !rule.includes('label-primary-foreground')).join(' | ').slice(0, 200),
+)
+check(
+  'the switch knob uses the theme foreground token',
+  panelCss.includes('.adp-knob{') && panelCss.includes('background:var(--dsw-alias-label-primary-foreground)'),
 )
 check(
   'the toggle mirrors the host switch tokens',
@@ -1573,6 +1583,88 @@ try {
 } finally {
   globalThis.fetch = realFetch
 }
+
+/* --- 19. Markdown rendering, mirroring the host assistant message --- */
+// A workspace Client half cannot import the Host's MarkdownText, so the plugin ships its
+// own renderer. It is pure given `h` and React, so the shipped source is evaluated here
+// and exercised directly.
+const mdStart = clientSource.indexOf('    /* ------------------------------------------------------------------ *\n     * Markdown, mirroring')
+const mdEnd = clientSource.indexOf('    /**\n     * Render one structured interaction from an ADP turn.')
+check('the client ships a markdown renderer', mdStart > 0 && mdEnd > mdStart)
+
+const mdFactory = new Function('h', 'React', `
+${clientSource.slice(mdStart, mdEnd)}
+return { blockNodes, inlineNodes };
+`)
+const stubH = (type, props, ...children) => ({ type, props: props || {}, children: children.flat() })
+const md = mdFactory(stubH, { useMemo: fn => fn() })
+
+/** Flatten rendered nodes into `[tag, text]` pairs for assertions. */
+const flatten = (nodes) => nodes.flatMap((node) => {
+  if (node === null || node === undefined || typeof node === 'string') return [node].filter(Boolean)
+  return [node.type, ...flatten(node.children)]
+})
+const tagsOf = (markdown) => md.blockNodes(markdown, 'k').map(node => node.type)
+/** Every anchor destination, which lives in props rather than children. */
+const hrefsOf = (nodes) => nodes.flatMap((node) => {
+  if (node === null || node === undefined || typeof node === 'string') return []
+  const own = node.type === 'a' && node.props && node.props.href ? [node.props.href] : []
+  return [...own, ...hrefsOf(node.children)]
+})
+
+check(
+  'bold, code and links become elements instead of literal markers',
+  (() => {
+    const nodes = md.blockNodes('加粗 **重点** 与 `代码` 和 [链接](https://example.com)', 'k')
+    const flat = flatten(nodes)
+    return flat.includes('strong') && flat.includes('code') && flat.includes('a')
+      && hrefsOf(nodes).includes('https://example.com')
+      && !flat.join('').includes('**')
+  })(),
+)
+check(
+  'CJK text keeps working next to emphasis (the host has a dedicated extension)',
+  flatten(md.blockNodes('**中文加粗**后面直接接中文', 'k')).includes('strong'),
+)
+check('headings map to h1..h6', JSON.stringify(tagsOf('# 一\n\n### 三')) === JSON.stringify(['h1', 'h3']))
+check(
+  'unordered and ordered lists become ul/ol with their items',
+  JSON.stringify(tagsOf('- 甲\n- 乙\n\n1. 一\n2. 二')) === JSON.stringify(['ul', 'ol']),
+)
+check(
+  'fenced code becomes a pre block',
+  (() => {
+    const nodes = md.blockNodes('```js\nconst a = 1\n```', 'k')
+    return nodes.length === 1 && nodes[0].type === 'pre'
+      && flatten(nodes).includes('const a = 1')
+  })(),
+)
+check(
+  'a pipe table becomes a real table',
+  (() => {
+    const nodes = md.blockNodes('| 名称 | 值 |\n| --- | --- |\n| 甲 | 1 |', 'k')
+    const flat = flatten(nodes)
+    return nodes[0].type === 'div' && flat.includes('table') && flat.includes('th') && flat.includes('td')
+      && flat.includes('名称') && flat.includes('甲')
+  })(),
+)
+check('blockquotes and rules are recognised', JSON.stringify(tagsOf('> 引用\n\n---')) === JSON.stringify(['blockquote', 'hr']))
+check(
+  'blank lines split paragraphs, a lone newline stays a soft break',
+  (() => {
+    const nodes = md.blockNodes('第一段\n\n第二句\n仍然同一段', 'k')
+    return nodes.length === 2 && nodes[0].type === 'p' && nodes[1].type === 'p'
+  })(),
+)
+check(
+  'non-http destinations never become anchors',
+  hrefsOf(md.blockNodes('[x](javascript:alert(1))', 'k')).length === 0
+    && !flatten(md.blockNodes('[x](javascript:alert(1))', 'k')).includes('a'),
+)
+check(
+  'the paragraph break from separate replies survives rendering',
+  md.blockNodes('第一批资料已获取。\n\n继续搜索。', 'k').length === 2,
+)
 
 gateway.close()
 

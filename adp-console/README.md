@@ -274,7 +274,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 152 项 | 通过 |
+| 自测 164 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -357,6 +357,31 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 对话内容按 DSH 的方式渲染
+
+原来助手回复是 `white-space: pre-wrap` 的纯文本，于是 `**文件路径**：[…](https://…)`
+这类 Markdown 标记**原样显示**。现在按宿主自己的渲染方式处理：
+
+**版式对齐宿主 transcript**（`MessageItem.module.css` / `AssistantMarkdown.module.css`）
+- 用户消息 → 右对齐气泡，`--dsw-specific-bubble` + `--dsw-radius-xl` + `10px 16px` 内边距
+- 助手回复 → **全宽正文，不再套气泡**（宿主就是这样：助手回答不是气泡）
+- 系统提示 → 居中、错误色
+
+**Markdown 渲染**（`MarkdownText.module.css` 的 token 逐个照搬）
+- 块级：标题、围栏代码、有序/无序列表（含嵌套）、引用、分隔线、管道表格、段落
+- 行内：**加粗**、*斜体*、`行内代码`、[链接](url)、~~删除线~~
+- 链接只允许 `http(s)`；`javascript:` 之类保持字面文本
+- 标点与 CJK 相邻的加粗（`**中文**后面接中文`）也能正确闭合 —— 宿主为此专门写了
+  `cjkFriendlyStrong` 扩展
+- 单换行按 **CommonMark 软换行**处理（宿主没有启用 `breaks` 扩展，保持一致）
+
+> 一个约束：工作区 Client half 只拿得到 `ctx / React / host / styles / console`
+> （`listBuiltins` 实测），**拿不到宿主的 `MarkdownText`**，所以解析器是插件自带的。
+> 样式只用主题 token，且对每个 token 都给了回退值。
+
+用真实回复验证（1260 字符、17 段）：`**文件路径**` 与 `**摘要**` 变成 `<strong>`，
+COS 链接变成 `<a>`（标签 `/workdir/agent_ppt_outline.md`），不再是字面标记。
 
 ### 多轮回复的分段
 

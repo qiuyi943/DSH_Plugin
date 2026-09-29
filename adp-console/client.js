@@ -266,12 +266,50 @@ window.__ModuleLoader__.load({
       '.adp-error{margin:0;padding:10px 12px;font-size:12px;color:var(--dsw-alias-state-error-primary)}',
       '.adp-chat{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}',
       '.adp-msgs{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}',
-      '.adp-msg{max-width:88%;padding:8px 10px;border-radius:10px;font-size:13px;',
-      'word-break:break-word}',
-      '.adp-msg.user{align-self:flex-end;background:var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary));',
-      'color:var(--dsw-alias-label-primary-foreground)}',
-      '.adp-msg.agent{align-self:flex-start;background:var(--dsw-alias-bg-layer-2)}',
-      '.adp-msgtext{white-space:pre-wrap}',
+      // Transcript layout mirrors the Host: user = right-aligned bubble, assistant =
+      // full-width prose, system = centred notice.
+      '.adp-msg{display:flex;max-width:100%;min-width:0;font-size:var(--dsh-content-font-size,13px)}',
+      '.adp-msg.user{justify-content:flex-end}',
+      '.adp-msg.agent{justify-content:flex-start}',
+      '.adp-msg.sys{justify-content:center}',
+      '.adp-msg.user .adp-bubble{max-width:min(82%,520px);padding:10px 16px;',
+      'border-radius:var(--dsw-radius-xl,16px);background:var(--dsw-specific-bubble,var(--dsw-alias-bg-layer-2));',
+      'color:var(--dsw-alias-label-primary)}',
+      '.adp-msg.agent .adp-bubble{width:100%;min-width:0}',
+      '.adp-msg.sys .adp-bubble{font-size:12px;color:var(--dsw-alias-state-error-primary);text-align:center}',
+      '.adp-msgtext{white-space:pre-wrap;word-break:break-word}',
+      // Markdown rules mirroring the Host sheet (MarkdownText.module.css) token for token.
+      '.adp-md{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-primary);',
+      'font:var(--dsw-font-markdown-base,13px/1.7 inherit)}',
+      '.adp-md>*:first-child{margin-top:0}',
+      '.adp-md>*:last-child{margin-bottom:0}',
+      '.adp-md strong{font-weight:600}',
+      '.adp-md h1{font-size:1.5em;margin:24px 0 12px}',
+      '.adp-md h2{font-size:1.3em;margin:24px 0 12px}',
+      '.adp-md h3{font-size:1.15em;margin:24px 0 12px}',
+      '.adp-md h4,.adp-md h5,.adp-md h6{font-size:1em;font-weight:600;margin:12px 0}',
+      '.adp-md p{margin:12px 0}',
+      '.adp-md a{color:var(--dsw-alias-link,var(--dsw-alias-label-primary));font-weight:500;text-decoration:none}',
+      '.adp-md a:hover{text-decoration:underline dotted var(--dsw-alias-link,currentColor);text-underline-offset:3px}',
+      '.adp-md :where(ul,ol){margin:12px 0;padding-left:18px}',
+      '.adp-md li:not(:first-child){margin-top:6px}',
+      '.adp-md li::marker{color:var(--dsw-alias-label-secondary)}',
+      '.adp-md hr{display:block;border:none;height:.5px;margin:24px 0;background:var(--dsw-alias-border-l2)}',
+      '.adp-md blockquote{border-left:2px solid var(--dsw-alias-label-caption);margin:12px 0 0;padding-left:14px}',
+      '.adp-md pre{margin:12px 0;padding:10px 12px;overflow:auto;border-radius:var(--dsw-radius-sm,8px);',
+      'background:var(--dsw-alias-bg-layer-2);border:0.5px solid var(--dsw-alias-border-l1);',
+      'font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:.875em}',
+      '.adp-md pre code{background:none;border:0;padding:0}',
+      '.adp-md :not(pre)>code{font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,monospace);',
+      'font-size:.875em;background:var(--dsw-alias-markdown-inline-code);border:0.5px solid var(--dsw-alias-border-l1);',
+      'border-radius:var(--dsw-radius-sm,8px);padding:0 5px}',
+      '.adp-md-table{max-width:100%;overflow-x:auto;overscroll-behavior-x:contain}',
+      '.adp-md-table table{border-collapse:collapse;width:max-content;max-width:100%}',
+      '.adp-md-table th{text-align:start;padding:10px 16px;border-bottom:0.5px solid var(--dsw-alias-border-l3);',
+      'font-weight:600;max-width:min(30vw,320px)}',
+      '.adp-md-table td{padding:10px 16px;border-bottom:0.5px solid var(--dsw-alias-border-l2);',
+      'max-width:min(30vw,320px)}',
+      '.adp-md-table th:first-child,.adp-md-table td:first-child{padding-left:0}',
       '.adp-card{margin-top:8px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
       'background:var(--dsw-alias-bg-layer-1)}',
       '.adp-cardtitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);margin-bottom:6px}',
@@ -463,6 +501,183 @@ window.__ModuleLoader__.load({
     }
 
     /** The right-hand conversation pane, streaming through the Host route. */
+    /* ------------------------------------------------------------------ *
+     * Markdown, mirroring the host's own assistant-message rendering
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Inline spans: code, links, strong, emphasis, strikethrough.
+     *
+     * The Host renders assistant prose through `MarkdownText` (micromark + GFM), but a
+     * workspace Client half only receives `React`, so the same shapes are produced here
+     * with the host's token names. `depth` guards pathological nesting.
+     */
+    function inlineNodes(text, keyPrefix, depth) {
+      const nodes = [];
+      const source = String(text);
+      const pattern = /`([^`\n]+)`|\[([^\]\n]*)\]\(([^)\s]+)\)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|~~([\s\S]+?)~~|\*([^*\n]+?)\*|_([^_\n]+?)_/g;
+      let cursor = 0;
+      let match;
+      let index = 0;
+      while ((match = pattern.exec(source)) !== null) {
+        if (match.index > cursor) nodes.push(source.slice(cursor, match.index));
+        const key = `${keyPrefix}-i${index++}`;
+        if (match[1] !== undefined) {
+          nodes.push(h('code', { key }, match[1]));
+        } else if (match[2] !== undefined) {
+          const href = match[3];
+          // Only http(s) destinations become anchors; anything else stays literal text.
+          nodes.push(/^https?:\/\//i.test(href)
+            ? h('a', { key, href, target: '_blank', rel: 'noreferrer' }, match[2] || href)
+            : match[0]);
+        } else if (match[4] !== undefined || match[5] !== undefined) {
+          const inner = match[4] !== undefined ? match[4] : match[5];
+          nodes.push(h('strong', { key }, depth > 0 ? inlineNodes(inner, key, depth - 1) : inner));
+        } else if (match[6] !== undefined) {
+          nodes.push(h('del', { key }, depth > 0 ? inlineNodes(match[6], key, depth - 1) : match[6]));
+        } else {
+          const inner = match[7] !== undefined ? match[7] : match[8];
+          nodes.push(h('em', { key }, depth > 0 ? inlineNodes(inner, key, depth - 1) : inner));
+        }
+        cursor = pattern.lastIndex;
+      }
+      if (cursor < source.length) nodes.push(source.slice(cursor));
+      return nodes;
+    }
+
+    /** The shared inline scanner for a block's text. */
+    const inline = (text, key) => inlineNodes(text, key, 2);
+
+    /** Split a table row into trimmed cells, tolerating the outer pipes. */
+    function tableCells(line) {
+      return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(cell => cell.trim());
+    }
+
+    const TABLE_DIVIDER = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+    /**
+     * Block-level markdown: headings, fences, lists, quotes, rules, tables, paragraphs.
+     *
+     * Deliberately CommonMark-ish rather than chat-lenient: the host adds no `breaks`
+     * extension, so a lone newline inside a paragraph stays a soft break.
+     */
+    function blockNodes(markdown, keyPrefix) {
+      const lines = String(markdown).replace(/\r\n?/g, '\n').split('\n');
+      const out = [];
+      let i = 0;
+      let block = 0;
+      const nextKey = () => `${keyPrefix}-b${block++}`;
+
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.trim() === '') { i += 1; continue; }
+
+        const fence = /^\s*(?:```|~~~)\s*([\w+#.-]*)\s*$/.exec(line);
+        if (fence !== null) {
+          const body = [];
+          i += 1;
+          while (i < lines.length && !/^\s*(?:```|~~~)\s*$/.test(lines[i])) { body.push(lines[i]); i += 1; }
+          i += 1;
+          out.push(h('pre', { key: nextKey(), className: 'adp-md-pre' },
+            h('code', null, body.join('\n'))));
+          continue;
+        }
+
+        const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+        if (heading !== null) {
+          const level = Math.min(heading[1].length, 6);
+          out.push(h(`h${level}`, { key: nextKey() }, inline(heading[2].replace(/\s+#+\s*$/, ''), nextKey())));
+          i += 1;
+          continue;
+        }
+
+        if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+          out.push(h('hr', { key: nextKey() }));
+          i += 1;
+          continue;
+        }
+
+        if (/^\s*>/.test(line)) {
+          const quoted = [];
+          while (i < lines.length && /^\s*>/.test(lines[i])) {
+            quoted.push(lines[i].replace(/^\s*>\s?/, ''));
+            i += 1;
+          }
+          out.push(h('blockquote', { key: nextKey() }, blockNodes(quoted.join('\n'), nextKey())));
+          continue;
+        }
+
+        // A table is a header row followed by a divider row.
+        if (line.includes('|') && i + 1 < lines.length && TABLE_DIVIDER.test(lines[i + 1])) {
+          const header = tableCells(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(tableCells(lines[i]));
+            i += 1;
+          }
+          out.push(h('div', { key: nextKey(), className: 'adp-md-table' },
+            h('table', null,
+              h('thead', null, h('tr', null, header.map((cell, column) =>
+                h('th', { key: `h${column}` }, inline(cell, `h${column}`))))),
+              h('tbody', null, rows.map((row, rowIndex) =>
+                h('tr', { key: `r${rowIndex}` }, row.map((cell, column) =>
+                  h('td', { key: `c${column}` }, inline(cell, `c${column}`)))))))));
+          continue;
+        }
+
+        const item = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+        if (item !== null) {
+          const ordered = /\d/.test(item[2]);
+          const indent = item[1].length;
+          const entries = [];
+          while (i < lines.length) {
+            const current = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i]);
+            if (current === null) break;
+            if (current[1].length < indent) break;
+            if (current[1].length > indent) {
+              // A deeper marker continues the previous item as a nested list.
+              const nested = [];
+              while (i < lines.length) {
+                const deeper = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i]);
+                if (deeper === null || deeper[1].length <= indent) break;
+                nested.push(lines[i].slice(indent + 1));
+                i += 1;
+              }
+              if (entries.length > 0) entries[entries.length - 1].children = nested.join('\n');
+              continue;
+            }
+            entries.push({ text: current[3] });
+            i += 1;
+          }
+          const listKey = nextKey();
+          out.push(h(ordered ? 'ol' : 'ul', { key: listKey }, entries.map((entry, position) =>
+            h('li', { key: `${listKey}-l${position}` },
+              inline(entry.text, `${listKey}-l${position}`),
+              entry.children === undefined ? null : blockNodes(entry.children, `${listKey}-l${position}`)))));
+          continue;
+        }
+
+        // Paragraph: consecutive plain lines, soft-broken exactly like the host.
+        const paragraph = [line];
+        i += 1;
+        while (i < lines.length && lines[i].trim() !== ''
+          && !/^\s*(?:#{1,6}\s|>|(?:```|~~~)|(?:[-*+]|\d+[.)])\s)/.test(lines[i])) {
+          paragraph.push(lines[i]);
+          i += 1;
+        }
+        out.push(h('p', { key: nextKey() }, inline(paragraph.join('\n'), nextKey())));
+      }
+      return out;
+    }
+
+    /** Assistant prose, rendered the way the Host renders its own. */
+    function Markdown(props) {
+      const { text, className } = props;
+      const nodes = React.useMemo(() => blockNodes(text, 'md'), [text]);
+      return h('div', { className: className === undefined ? 'adp-md' : `adp-md ${className}` }, nodes);
+    }
+
     /**
      * Render one structured interaction from an ADP turn.
      *
@@ -730,15 +945,22 @@ window.__ModuleLoader__.load({
             h('div', { className: 'adp-msgs', ref: scrollRef },
               messages.length === 0
                 ? h('div', { className: 'adp-empty' }, t('chatPick'))
-                : messages.map((message, index) => h('div', {
-                  key: index,
-                  className: `adp-msg ${message.role === 'user' ? 'user' : message.role === 'sys' ? 'sys' : 'agent'}`,
-                },
-                h('div', { className: 'adp-msgtext' },
-                  message.text === '' && busy && index === messages.length - 1 ? '…' : message.text),
-                (message.interactions || []).map((interaction, position) => renderInteraction(
-                  interaction, position, { busy, onChoose: label => void send(label) },
-                )))),
+                : messages.map((message, index) => {
+                  const role = message.role === 'user' ? 'user' : message.role === 'sys' ? 'sys' : 'agent';
+                  const pending = message.text === '' && busy && index === messages.length - 1;
+                  const interactions = (message.interactions || []).map((interaction, position) =>
+                    renderInteraction(interaction, position, { busy, onChoose: label => void send(label) }));
+                  // Mirror the Host's transcript: the user turn is a right-aligned bubble
+                  // while the assistant turn is full-width prose, not a second bubble.
+                  return h('div', { key: index, className: `adp-msg ${role}` },
+                    h('div', { className: 'adp-bubble' },
+                      pending
+                        ? h('div', { className: 'adp-md' }, '…')
+                        : role === 'agent'
+                          ? h(Markdown, { text: message.text })
+                          : h('div', { className: 'adp-msgtext' }, message.text),
+                      interactions));
+                }),
             ),
             h('div', { className: 'adp-compose' },
               h('textarea', {
