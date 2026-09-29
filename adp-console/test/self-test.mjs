@@ -1101,6 +1101,84 @@ check(
   JSON.stringify(structured.text),
 )
 
+/* --- 17. Chat state survives leaving the panel --- */
+// Switching main panels unmounts ChatPane. State kept in `useState` was lost, so the
+// conversation looked cleared on return. The shipped client keeps it in a module-level
+// store keyed by app id; that store is plain JavaScript and is evaluated here as-is.
+const clientSource = await readFile(join(here, '..', 'client.js'), 'utf8')
+const storeStart = clientSource.indexOf('    function createChatStore() {')
+const storeEnd = clientSource.indexOf('    function ChatPane(props) {')
+check('the client defines an external chat store', storeStart > 0 && storeEnd > storeStart)
+
+const storeFactory = new Function(
+  `${clientSource.slice(storeStart, storeEnd)}\nreturn { createChatStore, chatStore };`,
+)()
+const first = storeFactory.chatStore('app-1')
+let notified = 0
+const unsubscribe = first.subscribe(() => { notified += 1 })
+first.patch({ messages: [{ role: 'user', text: '你好' }], conversationId: 'c1' })
+check('the store notifies subscribers on change', notified === 1, `notified=${notified}`)
+
+// Remounting is exactly `chatStore(sameAppId).get()` — the data must still be there.
+const remounted = storeFactory.chatStore('app-1').get()
+check(
+  'a remount re-attaches to the same conversation',
+  remounted.messages.length === 1 && remounted.messages[0].text === '你好' && remounted.conversationId === 'c1',
+  JSON.stringify(remounted.messages),
+)
+check(
+  'functional updates still work through the store',
+  (() => {
+    first.patch(state => ({ ...state, messages: [...state.messages, { role: 'agent', text: '在' }] }))
+    return storeFactory.chatStore('app-1').get().messages.length === 2
+  })(),
+)
+check(
+  'each app gets its own store',
+  storeFactory.chatStore('app-2').get().messages.length === 0
+    && storeFactory.chatStore('app-1').get().messages.length === 2,
+)
+check(
+  'the user id is stable across remounts',
+  storeFactory.chatStore('app-1').get().userId === remounted.userId,
+)
+check(
+  'the pane does not abort its turn when unmounted',
+  !/useEffect\(\(\) => \(\) => \{ abortRef\.current\?\.abort/.test(clientSource)
+    && !/\babortRef\b/.test(clientSource),
+  'abortRef still present',
+)
+unsubscribe()
+check('unsubscribing stops notifications', (() => {
+  const before = notified
+  first.patch({ draft: 'x' })
+  return notified === before
+})())
+
+// The selected app has to survive too: `current` is derived from it, so losing it would
+// show an empty pane even with the store intact.
+check(
+  'the selected app survives leaving the panel',
+  /let lastSelectedAppId = ''/.test(clientSource)
+    && /useState\(\(\) => lastSelectedAppId\)/.test(clientSource)
+    && /lastSelectedAppId = appId/.test(clientSource),
+)
+check(
+  'the pane reads its conversation state from the store, not useState',
+  !/const \[messages, setMessages\] = useState/.test(clientSource)
+    && /useSyncExternalStore\(store\.subscribe, store\.get\)/.test(clientSource),
+)
+check(
+  'selecting another app does not wipe a stored conversation',
+  (() => {
+    const a = storeFactory.chatStore('keep-a')
+    a.patch({ messages: [{ role: 'user', text: 'hi' }] })
+    storeFactory.chatStore('keep-b').patch({ draft: 'typing' })
+    return storeFactory.chatStore('keep-a').get().messages.length === 1
+      && storeFactory.chatStore('keep-b').get().draft === 'typing'
+  })(),
+)
+
 gateway.close()
 
 /* ------------------------------------------------------------------ *

@@ -216,7 +216,7 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 98 项 | 通过 |
+| 自测 109 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
@@ -296,6 +296,30 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 面板状态：切换功能再切回来不清空
+
+切换主面板会**卸载**这个页面，所以状态放在 `useState` 里就会被丢掉 —— 现象是切走再切回来，
+对话内容、ADP 会话 ID、甚至选中的智能体全没了（`current` 由 `selected` 推导，选中态一丢就
+只剩空面板）。
+
+现在三样东西都活在模块作用域（随 Web 会话存续，不落盘）：
+
+| 状态 | 存放位置 |
+| --- | --- |
+| 消息、草稿、事件、ADP `ConversationId`、传输方式、`UserId`、进行中的 `AbortController` | 按 appId 分桶的 store，经 `useSyncExternalStore` 订阅 |
+| 选中的智能体 | 模块变量 `lastSelectedAppId`，作为 `useState` 初值 |
+
+要点：
+
+- **卸载不再中断进行中的对话**：原来 `useEffect(() => () => abortRef.current?.abort(), [])`
+  会在切走时掐断流；现在 controller 也在 store 里，切回来还能看到它继续跑完。
+- **`UserId` 重挂载后保持不变**（原来每次 `useMemo` 重新随机），否则同一会话在服务端会被当成新访客。
+- **换智能体不会误清**：store 按 appId 分桶，切回原来的应用仍是你原来的那段对话。
+- 「新会话」是唯一的显式重置入口。
+
+自测直接**求值线上 `client.js` 里的这段源码**（不是副本）来验证：remount 后数据仍在、
+分桶互不干扰、退订生效、`UserId` 稳定。
 
 ### 人在回环组件（AskUserQuestion / questionnaire）
 

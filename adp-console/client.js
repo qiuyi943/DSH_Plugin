@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    const { useCallback, useEffect, useMemo, useRef, useState } = React;
+    const { useCallback, useEffect, useRef, useState, useSyncExternalStore } = React;
 
     /** Locale namespace and the id shared by the sidebar entry and the main panel. */
     const NS = 'adpConsole';
@@ -521,35 +521,85 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'adp-card', key }, parts);
     }
 
+    /**
+     * Chat state that outlives the pane.
+     *
+     * Switching to another main panel unmounts this component, so state kept in
+     * `useState` was discarded and the conversation appeared cleared. The state lives in
+     * a module-level store keyed by app id instead: navigating away and back re-attaches
+     * to the same conversation, and a turn that is still streaming keeps filling it.
+     * The in-flight `AbortController` lives here too, so an unmount must not cancel it.
+     */
+    function createChatStore() {
+      let state = {
+        messages: [], draft: '', busy: false, events: [],
+        conversationId: '', transport: '', controller: null,
+        userId: `dshweb${Math.random().toString(36).slice(2)}`,
+      };
+      const listeners = new Set();
+      return {
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => { listeners.delete(listener); };
+        },
+        get() { return state; },
+        patch(update) {
+          state = typeof update === 'function' ? update(state) : { ...state, ...update };
+          for (const listener of [...listeners]) listener();
+        },
+      };
+    }
+
+    /** One store per ADP app, so switching apps switches conversation. */
+    const chatStores = new Map();
+    function chatStore(appId) {
+      const key = appId === undefined || appId === null ? '(none)' : String(appId);
+      let store = chatStores.get(key);
+      if (store === undefined) {
+        store = createChatStore();
+        chatStores.set(key, store);
+      }
+      return store;
+    }
+
     function ChatPane(props) {
       const { app, t } = props;
-      const [messages, setMessages] = useState([]);
-      const [draft, setDraft] = useState('');
-      const [busy, setBusy] = useState(false);
-      const [events, setEvents] = useState([]);
-      const [conversationId, setConversationId] = useState('');
-      const [transport, setTransport] = useState('');
-      const abortRef = useRef(null);
+      const store = chatStore(app && app.appId);
+      const { messages, draft, busy, events, conversationId, transport, userId } =
+        useSyncExternalStore(store.subscribe, store.get);
+
+      // Thin wrappers keep the original call sites readable while the data lives outside
+      // the component.
+      const setMessages = useCallback(
+        update => store.patch(state => ({
+          ...state,
+          messages: typeof update === 'function' ? update(state.messages) : update,
+        })), [store]);
+      const setEvents = useCallback(
+        update => store.patch(state => ({
+          ...state,
+          events: typeof update === 'function' ? update(state.events) : update,
+        })), [store]);
+      const setDraft = useCallback(value => store.patch({ draft: value }), [store]);
+      const setBusy = useCallback(value => store.patch({ busy: value }), [store]);
+      const setConversationId = useCallback(value => store.patch({ conversationId: value }), [store]);
+      const setTransport = useCallback(value => store.patch({ transport: value }), [store]);
       const scrollRef = useRef(null);
-      const userId = useMemo(() => `dshweb${Math.random().toString(36).slice(2)}`, []);
 
       useEffect(() => {
         if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       }, [messages]);
 
+      // Only the explicit "new conversation" button resets; a remount must not, because
+      // the store already holds the live conversation for this app.
       const reset = useCallback(() => {
-        abortRef.current?.abort();
-        abortRef.current = null;
-        setMessages([]);
-        setEvents([]);
-        setConversationId('');
-        setTransport('');
-        setBusy(false);
-      }, []);
-
-      // A different app is a different conversation.
-      useEffect(() => { reset(); }, [app && app.appId, reset]);
-      useEffect(() => () => { abortRef.current?.abort(); }, []);
+        const controller = store.get().controller;
+        if (controller) controller.abort();
+        store.patch({
+          messages: [], events: [], conversationId: '', transport: '', busy: false,
+          controller: null, draft: '',
+        });
+      }, [store]);
 
       const send = useCallback(async (override) => {
         const text = typeof override === 'string' ? override.trim() : draft.trim();
@@ -558,7 +608,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setMessages(previous => [...previous, { role: 'user', text }, { role: 'agent', text: '' }]);
         const controller = new AbortController();
-        abortRef.current = controller;
+        store.patch({ controller });
         try {
           const response = await fetch(`${ROUTE}/chat`, {
             method: 'POST',
@@ -641,7 +691,7 @@ window.__ModuleLoader__.load({
             setMessages(previous => [...previous, { role: 'sys', text: String(error.message || error) }]);
           }
         } finally {
-          abortRef.current = null;
+          store.patch({ controller: null });
           setBusy(false);
         }
       }, [app, busy, conversationId, draft, t, userId]);
@@ -697,7 +747,7 @@ window.__ModuleLoader__.load({
                 ? h('button', {
                   className: 'adp-btn',
                   type: 'button',
-                  onClick: () => abortRef.current?.abort(),
+                  onClick: () => store.get().controller?.abort(),
                 }, t('stop'))
                 : h('button', {
                   className: 'adp-btn primary',
@@ -943,6 +993,12 @@ window.__ModuleLoader__.load({
     }
 
     /** The panel page: catalogue on the left, conversation on the right. */
+    /**
+     * The app chosen in the pane, kept outside the component so returning to this panel
+     * restores the same conversation instead of an empty one.
+     */
+    let lastSelectedAppId = '';
+
     function AdpPage() {
       const ctx = React.useContext(AdpContext);
       const t = ctx.t;
@@ -954,7 +1010,11 @@ window.__ModuleLoader__.load({
       const [onlyEnabled, setOnlyEnabled] = useState(false);
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
-      const [selected, setSelected] = useState('');
+      const [selected, setSelectedState] = useState(() => lastSelectedAppId);
+      const setSelected = useCallback((appId) => {
+        lastSelectedAppId = appId;
+        setSelectedState(appId);
+      }, []);
       const [busyId, setBusyId] = useState('');
       const [showSettings, setShowSettings] = useState(false);
 
