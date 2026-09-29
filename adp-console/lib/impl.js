@@ -9,6 +9,8 @@
  *     The gate is plugin-owned state, persisted as JSON, and it is enforced in every
  *     path that can reach the ADP conversation API (tools and the browser route).
  *  3. The agent-facing tools and the same-origin browser route the Client panel uses.
+ *  4. The `@` mention bridge: a prompt that names an enabled app is answered by that
+ *     app, through the `llm/stream` routing seam, instead of by the model.
  *
  * The ADP conversation call itself is the HTTP SSE endpoint documented at
  * https://cloud.tencent.com/document/product/1759/129202
@@ -80,6 +82,21 @@ export const DEFAULT_CONFIG = {
   appKeyCacheMs: 300000,
   /** Register the agent-facing tools. */
   exposeTools: true,
+  /**
+   * Register the `@` bridge: `@` an enabled app in a session and that turn is answered
+   * by the app instead of the model. `false` registers neither Host listener and reports
+   * `bridge:false`, which is what makes the Client drop its `@` group; the panel and the
+   * tools are untouched.
+   */
+  mentionEnabled: true,
+  /**
+   * How long a `@` pick stays armed for the message that carries it. The pick resolves
+   * the app up front (the prompt itself only carries the readable `@name`), so the arm
+   * has to survive the typing between the pick and the send.
+   */
+  mentionPickTtlMs: 1800000,
+  /** How long the enabled-app name index used to resolve a hand-typed mention is reused. */
+  mentionIndexMs: 60000,
   /**
    * Prefer the official `tencentcloud-sdk-nodejs-adp` for management calls.
    * When it is not installed the plugin falls back to its built-in TC3 signer.
@@ -860,19 +877,27 @@ function extractDeltaText(payload) {
  * `message.done` holds `Message.Contents[]`, `response.completed` holds `Response.Messages[]`.
  * Any message the stream already labelled `thought` is excluded.
  */
-function extractFinalText(record, messageKinds = new Map()) {
-  if (record === null || typeof record !== 'object') return ''
+function extractFinalParts(record, messageKinds = new Map()) {
+  const out = new Map()
+  if (record === null || typeof record !== 'object') return out
   const messages = Array.isArray(record.Messages) ? record.Messages : [record]
-  let out = ''
   for (const message of messages) {
     if (message === null || typeof message !== 'object') continue
     if (messageKinds.get(message.MessageId) === 'thought' || message.MessageType === 'thought') continue
     if (message.Type === 'thought') continue
     if (!Array.isArray(message.Contents)) continue
+    let text = ''
     for (const content of message.Contents) {
       if (content && typeof content === 'object' && content.Type === 'text' && typeof content.Text === 'string') {
-        out += content.Text
+        text += content.Text
       }
+    }
+    // A message with no text (a questionnaire, a file) contributes no paragraph.
+    if (text !== '') {
+      const key = typeof message.MessageId === 'string' && message.MessageId !== ''
+        ? message.MessageId
+        : `#${out.size}`
+      out.set(key, text)
     }
   }
   return out
@@ -969,11 +994,30 @@ function addedMessageKind(payload) {
 function createChatReducer(onEvent) {
   /** MessageId → the kind declared by `message.added`. */
   const kinds = new Map()
-  let delta = ''
-  let authoritative = ''
+  /**
+   * Reply text per message id, in arrival order.
+   *
+   * One turn is not one message: a Claw agent narrates each step as its own `reply`
+   * ("第一批资料已获取。", "继续搜索验证关键数据与产品信息。", …). Concatenating them
+   * produced a single run-on paragraph, so each message keeps its own part and the parts
+   * are joined with a blank line.
+   */
+  const parts = new Map()
+  let authoritativeParts = null
   let failure = null
   /** Structured, non-text content from the authoritative final record. */
   let interactions = []
+
+  const keyOf = (payload) => {
+    const id = payload?.MessageId
+    return typeof id === 'string' && id !== '' ? id : ''
+  }
+  const append = (key, text) => {
+    const previous = parts.get(key)
+    parts.set(key, previous === undefined ? text : previous + text)
+    return previous === undefined
+  }
+  const join = (map) => [...map.values()].filter(part => part !== '').join('\n\n')
 
   const push = (name, payload) => {
     const isError = name === 'error' || name.endsWith('.error')
@@ -989,28 +1033,35 @@ function createChatReducer(onEvent) {
       const chunk = extractDeltaText(payload)
       const kind = kinds.get(payload?.MessageId)
       // Reasoning (`thought`) frames are not part of the answer.
-      if (kind === undefined || kind === 'reply') {
-        text = chunk
-        delta += chunk
+      if (chunk !== '' && (kind === undefined || kind === 'reply')) {
+        const key = keyOf(payload)
+        const isNewPart = append(key, chunk)
+        // A new message starts a paragraph, so the separator rides the first delta and
+        // the panel — which appends deltas — shows the break while it streams.
+        const separator = isNewPart && parts.size > 1 ? '\n\n' : ''
+        text = separator + chunk
       }
     } else if (name === 'text.replace') {
-      // A replace frame restates the whole visible answer; it is not an append.
+      // A replace frame restates one message's whole text; it is not an append.
       const chunk = extractDeltaText(payload)
       const kind = kinds.get(payload?.MessageId)
       if (kind === undefined || kind === 'reply') {
-        text = chunk
-        delta = chunk
+        const key = keyOf(payload)
+        const isNewPart = !parts.has(key)
+        parts.set(key, chunk)
+        const separator = isNewPart && parts.size > 1 ? '\n\n' : ''
+        text = separator + chunk
       }
     } else if (name === 'message.done') {
       // Completion frames restate the whole answer; they are not incremental, so they
       // must not reach the delta sink or the caller would append the answer twice.
-      const final = extractFinalText(payload?.Message, kinds)
-      if (final !== '') authoritative = final
+      const final = extractFinalParts(payload?.Message, kinds)
+      if (final.size > 0) authoritativeParts = final
       const found = extractInteractions(payload?.Message)
       if (found.length > 0) interactions = found
     } else if (name === 'response.completed') {
-      const final = extractFinalText(payload?.Response, kinds)
-      if (final !== '') authoritative = final
+      const final = extractFinalParts(payload?.Response, kinds)
+      if (final.size > 0) authoritativeParts = final
       // The completed response restates every message, so it is authoritative for
       // structured content too.
       const found = extractInteractions(payload?.Response)
@@ -1024,7 +1075,7 @@ function createChatReducer(onEvent) {
     push,
     failure: () => failure,
     /** `message.done` / `response.completed` restate the whole answer, so they win. */
-    result: () => (authoritative !== '' ? authoritative : delta),
+    result: () => (authoritativeParts !== null ? join(authoritativeParts) : join(parts)),
     /** Questionnaires and files carried by the turn, ready for the panel to render. */
     interactions: () => interactions,
   }
@@ -1463,6 +1514,130 @@ function projectApp(summary, enabled, release) {
 }
 
 /* ------------------------------------------------------------------ *
+ * `@` mention bridge
+ * ------------------------------------------------------------------ */
+
+/**
+ * The `@` token that releases the session back to the model.
+ *
+ * The exit is a pick like any other, so leaving ADP mode is one message the user
+ * writes on purpose rather than an implicit boundary the plugin guesses at.
+ */
+export const MENTION_EXIT_TOKEN = 'DSH'
+
+/** Sent when the message was nothing but the mention — an app still needs a first turn. */
+export const MENTION_OPENING = '你好'
+
+/**
+ * The single word a pick inserts after `@`.
+ *
+ * The prompt is the only durable trace of a pick, and the Chat view decorates a
+ * whitespace-bounded `@token`, so the token must be one word: whitespace becomes `-`
+ * and anything else the token grammar cannot carry is dropped. The app name is a
+ * display label, never an identity — the id rides the pick, not the prompt.
+ * @param name - the app's display name.
+ * @param appId - fallback when the name leaves no usable token.
+ * @returns the token without its leading `@`.
+ */
+export function mentionToken(name, appId = '') {
+  const cleaned = String(name ?? '')
+    .replace(/\s+/gu, '-')
+    .replace(/[^\p{L}\p{N}_.-]/gu, '')
+    .replace(/^-+|-+$/gu, '')
+  if (cleaned !== '') return cleaned
+  const fallback = String(appId ?? '').replace(/[^\p{L}\p{N}_.-]/gu, '')
+  return fallback !== '' ? fallback : 'adp'
+}
+
+/** Sentence punctuation a typed `@token` may carry without being part of the token. */
+const MENTION_TRAILING_PUNCTUATION = /[.,;:!?，。；：！？、]+$/u
+
+/**
+ * Every whitespace-bounded `@token` of one text, in occurrence order.
+ *
+ * The shape matches the Chat view's own decoration rule, so what the user sees as a
+ * mention is exactly what resolution considers.
+ * @param text - a prompt text.
+ * @returns `{ name, mention }` per occurrence; `name` has no leading `@`.
+ */
+export function mentionTokensIn(text) {
+  if (typeof text !== 'string' || !text.includes('@')) return []
+  const out = []
+  const pattern = /(^|\s)@([^\s@]+)/gu
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const name = match[2].replace(MENTION_TRAILING_PUNCTUATION, '')
+    if (name === '') continue
+    out.push({ name, mention: `@${name}` })
+  }
+  return out
+}
+
+/**
+ * Drop one mention occurrence from a prompt, keeping the rest of the text intact.
+ * @param text - the original prompt text.
+ * @param name - the token's name, with or without its leading `@`.
+ * @returns the remaining text, trimmed.
+ */
+export function removeMentionToken(text, name) {
+  const bare = String(name ?? '').replace(/^@/u, '')
+  if (bare === '' || typeof text !== 'string') return text
+  const escaped = bare.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  return text
+    .replace(new RegExp(`(^|[\\s])@${escaped}(?=\\s|$)`, 'gu'), '$1')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .replace(/[ \t]+$/gmu, '')
+    .trim()
+}
+
+/** The text blocks of one message, joined as the user wrote them. */
+export function messageTextOf(message) {
+  const content = Array.isArray(message?.content) ? message.content : []
+  return content
+    .filter(block => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n')
+}
+
+/**
+ * Render human-in-the-loop forms as assistant text.
+ *
+ * A Claw agent asks through `AskUserQuestion`, and the platform delivers the form as a
+ * `questionnaire` content with **no text at all** — so a text-only bridge would drop the
+ * question the turn was about. Answering matches the panel's protocol: the option's
+ * label is the next message.
+ * @param interactions - normalised descriptors from {@link extractInteractions}.
+ * @returns Markdown for the assistant message, or '' when there is nothing to render.
+ */
+export function renderInteractions(interactions) {
+  const list = Array.isArray(interactions) ? interactions : []
+  const lines = []
+  for (const item of list) {
+    if (item?.kind === 'questionnaire') {
+      lines.push(`**${item.title || '需要你确认'}**`)
+      for (const question of Array.isArray(item.questions) ? item.questions : []) {
+        const marks = [question.required === true ? '必填' : '', question.multiSelect === true ? '可多选' : '']
+          .filter(Boolean)
+        lines.push(`${(question.index ?? 0) + 1}. ${question.question}${marks.length === 0 ? '' : `（${marks.join('、')}）`}`)
+        for (const option of Array.isArray(question.options) ? question.options : []) {
+          lines.push(`   - **${option.label}**${option.description ? `：${option.description}` : ''}`)
+        }
+      }
+      lines.push('直接回复你要选的选项名称即可继续。')
+    } else if (item?.kind === 'file') {
+      lines.push(`📄 ${item.name || '产出文件'}${item.url ? ` — ${item.url}` : ''}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/** A stable ADP `UserId` for one DSH session, so a conversation keeps one visitor. */
+export function mentionUserId(sessionId) {
+  const compact = String(sessionId ?? '').replace(/[^a-zA-Z0-9]/gu, '')
+  return compact === '' ? 'dshsession' : `dsh${compact.slice(0, 40)}`
+}
+
+/* ------------------------------------------------------------------ *
  * Plugin body
  * ------------------------------------------------------------------ */
 
@@ -1698,6 +1873,7 @@ export function apply(ctx, config) {
         if (input.enabled) state.enabledAppIds.add(appId)
         else state.enabledAppIds.delete(appId)
         await persist()
+        resetMentionIndex()
         await ctx.emit?.('adp-console/changed', undefined)
         return { appId, dshEnabled: input.enabled, enabledAppIds: [...state.enabledAppIds].sort(), statePath }
       },
@@ -1779,6 +1955,273 @@ export function apply(ctx, config) {
         return { appId, conversationId: result.conversationId, transport: result.transport, reply: result.text }
       },
     }), 'adp-console: adp_chat')
+  }
+
+  /* ---------------- `@` mention bridge ---------------- */
+
+  /**
+   * Sessions bound to one ADP app, keyed by session id — `{ appId, name, body }`.
+   *
+   * In memory on purpose: the binding is a derived cache and the durable record of a
+   * pick is the `@name` in the prompt itself, so a restarted Harness re-binds on the
+   * next mention instead of resurrecting something the user cannot see.
+   */
+  const mentionRoutes = new Map()
+  /** Picks recorded by the Client that the prompt carrying them has not arrived for yet. */
+  const mentionPicks = new Map()
+  /** ADP `ConversationId` per session + app, so a follow-up keeps its context. */
+  const mentionConversations = new Map()
+  /** Enabled-app index by mention token, refreshed at most `mentionIndexMs`. */
+  let mentionIndex = { at: 0, byToken: new Map() }
+
+  /** The apps this Harness may mention: 已上线 on ADP and 已上架 here. */
+  async function mentionTargets(signal) {
+    const { apps } = await readCatalogue({ status: 'running', pageSize: 100 }, signal)
+    return apps
+      .filter(app => app.dshEnabled)
+      .map(app => ({
+        appId: app.appId,
+        name: app.name,
+        // The mention token is derived here, not in the browser: the Host resolves the
+        // same token back to this app, so both ends must agree on the spelling.
+        token: mentionToken(app.name, app.appId),
+        appModeLabel: app.appModeLabel,
+        adpStatus: app.adpStatus,
+        adpStatusLabel: app.adpStatusLabel,
+      }))
+  }
+
+  /** Token → app for the enabled apps, cached for `mentionIndexMs`. */
+  async function mentionIndexFor(signal) {
+    if (Date.now() - mentionIndex.at < settings.mentionIndexMs) return mentionIndex.byToken
+    const byToken = new Map()
+    for (const target of await mentionTargets(signal)) byToken.set(target.token.toLowerCase(), target)
+    mentionIndex = { at: Date.now(), byToken }
+    return byToken
+  }
+
+  /** The gate changed, so the mention index describes applications that no longer apply. */
+  function resetMentionIndex() {
+    mentionIndex = { at: 0, byToken: new Map() }
+  }
+
+  /**
+   * Resolve the `@` mention of one prompt against the session's armed pick.
+   *
+   * A Client pick is the exact app the user clicked; a hand-typed or pasted `@name`
+   * falls back to the enabled-app index, which is also what makes a mention survive
+   * being copied into another session.
+   * @param sessionId - the session whose pick may be armed.
+   * @param text - the newest user message text.
+   * @param signal - the pre-step cancellation boundary.
+   * @returns `{ appId, name }` (`appId: null` = the exit token), or undefined for none.
+   */
+  async function resolveMention(sessionId, text, signal) {
+    const tokens = mentionTokensIn(text)
+    const pick = mentionPicks.get(sessionId)
+    if (pick !== undefined) {
+      mentionPicks.delete(sessionId)
+      const armed = Date.now() - pick.at <= settings.mentionPickTtlMs
+      const carried = tokens.some(entry => entry.name.toLowerCase() === pick.name.toLowerCase())
+      if (armed && carried) return { appId: pick.appId, name: pick.name }
+    }
+    if (tokens.length === 0) return undefined
+    // `@DSH` typed by hand is the same exit the menu row performs.
+    const exit = tokens.find(entry => entry.name.toLowerCase() === MENTION_EXIT_TOKEN.toLowerCase())
+    if (exit !== undefined) return { appId: null, name: exit.name }
+    try {
+      const byToken = await mentionIndexFor(signal)
+      for (const entry of tokens) {
+        const hit = byToken.get(entry.name.toLowerCase())
+        if (hit !== undefined) return { appId: hit.appId, name: entry.name }
+      }
+    } catch (error) {
+      console.error(`[adp-console] 无法解析 @ 提及：${error.message}`)
+    }
+    return undefined
+  }
+
+  /**
+   * Bind the session from its newest user message, and strip the mention from that
+   * message: it addressed an app, not prose. A message with no mention keeps the
+   * binding, so one conversation with one app stays a conversation.
+   * @returns replacement messages when a mention had to be removed, else undefined.
+   */
+  async function claimMention(agent, messages, signal) {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined
+    let claim
+    for (const message of messages) {
+      if (message?.source?.kind !== 'user') continue
+      const text = messageTextOf(message)
+      if (text.trim() === '') continue
+      claim = { message, text }
+    }
+    if (claim === undefined) return undefined
+
+    const sessionId = String(agent.session.id)
+    const resolved = await resolveMention(sessionId, claim.text, signal)
+    const previous = mentionRoutes.get(sessionId)
+    if (resolved !== undefined && resolved.appId === null) {
+      mentionRoutes.delete(sessionId)
+    } else {
+      const bound = resolved ?? previous
+      if (bound !== undefined) {
+        mentionRoutes.set(sessionId, {
+          appId: bound.appId,
+          name: bound.name,
+          body: resolved === undefined ? claim.text : removeMentionToken(claim.text, resolved.name),
+        })
+      }
+    }
+    if (resolved === undefined) return undefined
+    return messages.map((message) => {
+      if (message !== claim.message) return message
+      const content = message.content.map(block => block !== null && typeof block === 'object' && block.type === 'text'
+        ? { ...block, text: removeMentionToken(block.text, resolved.name) }
+        : block)
+      return { ...message, content }
+    })
+  }
+
+  /**
+   * Answer one turn from the bound ADP app instead of the model.
+   *
+   * `llm/stream` is the documented seam for exactly this ("retry, replay, routing"):
+   * yielding the chunks here short-circuits the provider call, and the loop assembles
+   * the ADP answer into an ordinary assistant message. Nothing is thrown at the loop —
+   * an ADP failure becomes visible text plus a terminal chunk, so a broken app answers
+   * in the conversation instead of blanking the turn.
+   */
+  async function* streamMentionReply(sessionId, route, signal) {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+
+    /** Deltas the reducer produced but this generator has not yielded yet. */
+    const queue = []
+    let wake
+    let finished = false
+    let failure
+    let result
+    const controller = new AbortController()
+    const onAbort = () => controller.abort(signal?.reason)
+    if (signal?.aborted === true) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+    const conversationKey = `${sessionId}::${route.appId}`
+    const userId = mentionUserId(sessionId)
+
+    const chat = (async () => {
+      try {
+        await stateReady
+        assertEnabled(route.appId)
+        const appKey = await appKeyFor(route.appId, controller.signal)
+        result = await runAdpChat({
+          transport: settings.chatTransport,
+          endpoint: credentials.chatEndpoint,
+          wsEndpoint: credentials.wsEndpoint,
+          idleTimeoutMs: settings.chatIdleTimeoutMs,
+          timeoutMs: settings.chatTimeoutMs,
+          appKey,
+          message: route.body === '' ? MENTION_OPENING : route.body,
+          conversationId: mentionConversations.get(conversationKey),
+          userId,
+          signal: controller.signal,
+          onEvent: (_name, _payload, delta) => {
+            if (!delta) return
+            queue.push(delta)
+            wake?.()
+            wake = undefined
+          },
+          openConversation: async () => {
+            const created = await createApiConversation(credentials, route.appId, appKey, userId, controller.signal)
+            mentionConversations.set(conversationKey, created)
+            return created
+          },
+          openWebSocketToken: () => createWebSocketToken(credentials, route.appId, appKey, userId, controller.signal),
+        })
+      } catch (error) {
+        failure = error
+      } finally {
+        finished = true
+        wake?.()
+        wake = undefined
+      }
+    })()
+
+    let text = ''
+    try {
+      for (;;) {
+        if (queue.length > 0) {
+          const delta = queue.shift()
+          text += delta
+          yield { type: 'text-delta', index: 0, text: delta }
+          continue
+        }
+        if (finished) break
+        await new Promise((resolve) => { wake = resolve })
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+      // A consumer that stops early (the user hit stop) owns the cancellation.
+      if (!finished) controller.abort(new Error('@ 会话被取消'))
+    }
+    await chat
+
+    // The completion frame restates the whole answer; stream the part the deltas did
+    // not carry so the visible text never loses its tail.
+    const authoritative = typeof result?.text === 'string' ? result.text : ''
+    if (authoritative !== '' && authoritative !== text) {
+      if (authoritative.startsWith(text)) yield { type: 'text-delta', index: 0, text: authoritative.slice(text.length) }
+      text = authoritative
+    }
+    const forms = renderInteractions(result?.interactions)
+    if (forms !== '') {
+      const addition = `${text === '' ? '' : '\n\n'}${forms}`
+      text += addition
+      yield { type: 'text-delta', index: 0, text: addition }
+    }
+    if (failure !== undefined) {
+      const aborted = signal?.aborted === true || failure?.name === 'AbortError'
+      const message = failure instanceof Error ? failure.message : String(failure)
+      if (aborted) {
+        if (text !== '') yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message, code: 'ABORTED' } } }
+        return
+      }
+      const addition = `${text === '' ? '' : '\n\n'}> ⚠️ ADP 会话失败：${message}`
+      text += addition
+      yield { type: 'text-delta', index: 0, text: addition }
+      console.error(`[adp-console] @${route.name} 会话失败：${message}`)
+    }
+    if (text === '') text = '（ADP 应用没有返回任何内容。）'
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+
+  if (settings.mentionEnabled !== false) {
+    ctx.effect(() => ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+      const decision = await next()
+      if (decision.kind === 'reject') return decision
+      const rewritten = await claimMention(agent, decision.messages, signal)
+      // Spread: the downstream decision may carry fields this listener knows nothing of.
+      return rewritten === undefined ? decision : { ...decision, messages: rewritten }
+    }), 'adp-console: @ mention binding')
+
+    ctx.effect(() => ctx.on('llm/stream', (options, next) => {
+      // Auxiliary calls (compaction, session titles) are the model's own bookkeeping.
+      if (options.purpose !== undefined || options.sessionId === undefined) return next()
+      const sessionId = String(options.sessionId)
+      const route = mentionRoutes.get(sessionId)
+      if (route === undefined) return next()
+      return streamMentionReply(sessionId, route, options.signal)
+    }), 'adp-console: @ mention bridge')
+
+    ctx.effect(() => ctx.on('session/disposed', (session) => {
+      const id = String(session.id)
+      mentionRoutes.delete(id)
+      mentionPicks.delete(id)
+      for (const key of [...mentionConversations.keys()]) {
+        if (key.startsWith(`${id}::`)) mentionConversations.delete(key)
+      }
+    }), 'adp-console: @ mention state')
   }
 
   /* ---------------- browser route for the Client panel ---------------- */
@@ -1892,6 +2335,45 @@ export function apply(ctx, config) {
             send({ ...result, enabledAppIds: [...state.enabledAppIds].sort() })
             return
           }
+          if (req.method === 'GET' && route === '/mention-apps') {
+            await stateReady
+            const configured = credentials.secretId !== '' && credentials.secretKey !== ''
+            const exit = { token: MENTION_EXIT_TOKEN, label: 'DSH 本体' }
+            // `bridge` lets the Client drop the menu group entirely when this half is off.
+            const bridge = settings.mentionEnabled !== false
+            if (!configured || !bridge) {
+              send({ configured, bridge, apps: [], exit })
+              return
+            }
+            send({ configured, bridge, apps: await mentionTargets(abortSignalFor(req, res)), exit })
+            return
+          }
+          if (req.method === 'POST' && route === '/bind') {
+            await stateReady
+            const body = await readJsonBody(req)
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+            const name = typeof body.token === 'string' ? body.token.trim().replace(/^@/u, '') : ''
+            if (sessionId === '' || name === '') {
+              throw new AdpError('sessionId 与 token 必填。', { code: 'InvalidArgs' })
+            }
+            const appId = body.appId === null || body.appId === undefined || body.appId === ''
+              ? null
+              : String(body.appId).trim()
+            // The gate is the whole point of the console: a pick cannot arm an app it
+            // could not call a moment later.
+            if (appId !== null) assertEnabled(appId)
+            mentionPicks.set(sessionId, { appId, name, at: Date.now() })
+            if (appId === null) mentionRoutes.delete(sessionId)
+            // A session that is picked into but never sends must not accumulate.
+            if (mentionPicks.size > 200) {
+              const cutoff = Date.now() - settings.mentionPickTtlMs
+              for (const [key, value] of mentionPicks) {
+                if (value.at < cutoff) mentionPicks.delete(key)
+              }
+            }
+            send({ sessionId, appId, token: name })
+            return
+          }
           if (req.method === 'POST' && route === '/enabled') {
             const body = await readJsonBody(req)
             const appId = typeof body.appId === 'string' ? body.appId.trim() : ''
@@ -1900,6 +2382,7 @@ export function apply(ctx, config) {
             if (body.enabled === true) state.enabledAppIds.add(appId)
             else state.enabledAppIds.delete(appId)
             await persist()
+            resetMentionIndex()
             send({ appId, dshEnabled: body.enabled === true, enabledAppIds: [...state.enabledAppIds].sort() })
             return
           }

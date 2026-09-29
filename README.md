@@ -6,7 +6,7 @@ DeepSeek Harness（DSH）插件集合。每个子目录是一个可独立安装�
 
 | 目录 | 说明 |
 | --- | --- |
-| [`adp-console/`](./adp-console) | 腾讯云 ADP 智能体应用控制台：查看已发布应用清单、上架/下架（DSH 调用开关）、与已上架应用对话（SSE 优先，自动回退 WebSocket）。详见该目录的 [README](./adp-console/README.md)。 |
+| [`adp-console/`](./adp-console) | 腾讯云 ADP 智能体应用控制台：查看已发布应用清单、上架/下架（DSH 调用开关）、与已上架应用对话（SSE 优先，自动回退 WebSocket），并支持**在任意会话里用 `@` 直接与已上架应用对话**（走 `llm/stream` 路由，回复就是应用原文）。详见该目录的 [README](./adp-console/README.md)。 |
 
 ## 安装
 

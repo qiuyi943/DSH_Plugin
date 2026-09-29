@@ -15,7 +15,8 @@
 | 上架 / 下架 | 插件本地的 **DSH 调用开关**。上架 = 允许 DSH 通过 ADP 会话接口调用该应用；下架 = 禁止 |
 | 发布到 ADP | 对尚未成功发布的应用调用 `CreateRelease` 并轮询 `DescribeLatestRelease` 直到任务终态 |
 | 会话 | 对已上架的应用调用 ADP 会话接口（SSE 优先，查不到应用时自动回退 WebSocket），面板里流式显示回复，并渲染 `questionnaire` 等人在回环组件；管理接口走官方 ADP SDK |
-| Agent 工具 | 向模型暴露 4 个工具，Agent 也能列清单、切换开关、发布、对话 |
+| `@` 对话 | 会话输入框里 `@` 一个已上架应用，**这一轮由该应用回答**（走 `llm/stream` 路由，不经过会话模型）：见 [§4.6](#46-在会话里用--与智能体对话) |
+| Agent 工具 | 向模型暴露 5 个工具，Agent 也能列清单、切换开关、发布、对话 |
 
 ### 关于「上架 / 下架」的准确语义
 
@@ -132,6 +133,61 @@ cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modu
 内置签名回退  → 完整回复 "OK" · 通道 ws · 3.2s
 ```
 
+## 4.6 在会话里用 `@` 与智能体对话
+
+**一句话**：在任意会话（包括新会话）的输入框里打 `@`，菜单里会多出一个 **「ADP 智能体」** 分组，
+列出所有**已上架**的应用；选中一个再发消息，**这一轮就由那个应用回答，而不是由会话模型回答**。
+
+### 它怎么工作（为什么不是「工具调用」）
+
+DSH 的模型调用有一层文档化的中间件：`llm/stream` waterfall
+（*"Waterfall around every streaming model call (retry, replay, routing)"*）。
+本插件在这里用 ADP 的会话流**直接产出** provider 层的 `StreamChunk`
+（`block-start` / `text-delta` / `block-end` / `finish`），于是：
+
+- 没有调用会话模型，也没有把提问转述给模型 —— 回复就是 ADP 应用的原文；
+- 回复仍然是一条**普通的助手消息**，照常落进会话日志、照常流式显示、照常可以 fork/回看；
+- 单轮里的推理（`thought`）帧依旧被过滤，人在回环表单依旧被解析（见下）。
+
+### 绑定：@ 的是什么，靠什么认出来
+
+prompt 里只留**可读的 `@应用名`**（例如 `@客服助手 帮我看下数据`），而不是一串 id ——
+聊天视图会把 `@token` 渲染成 chip，塞进 id 只会显示成一坨原文。
+应用 id 走一条**带外的绑定**：
+
+| 时机 | 通道 | 作用 |
+| --- | --- | --- |
+| 在 `@` 菜单里选中 | `POST /adp-console/bind` | 把 `(会话 → appId)` 记在 Host 内存里，等待下一条消息 |
+| 发送 | 会话本身 | 文本只带 `@客服助手 …`；Host 在 `agent/pre-step` 里消费绑定、**删掉 mention**、把消息绑到该应用 |
+| 回答 | `llm/stream` | 用绑定的应用发这一轮；ADP 的 `ConversationId` 按 (会话, 应用) 复用 |
+
+三条由此而来的行为：
+
+1. **后续消息不用再 @**：绑定跟着会话走，`再详细点` 依旧发给同一个应用（同一段 ADP 会话）。
+2. **手打/粘贴的 `@应用名` 也认**：没有绑定记录时，Host 按「已上架应用名」的索引解析，
+   所以把消息复制到另一个会话、或者手敲一遍，同样能路由。
+3. **`@DSH` 是出口**：`@` 菜单最后一行「DSH 本体」清掉绑定并删掉 mention，
+   这一轮重新交回会话模型。
+
+`@` 菜单只列**同时满足「ADP 已上线」与「插件已上架」**的应用 —— 菜单就等于「DSH 现在能调用谁」。
+会话中途下架该应用，下一轮会得到一条说明（「未上架…」）而不是静默失败。
+
+### 人在回环表单
+
+Claw 类应用会用 `AskUserQuestion` 提问，而平台下发的是**没有正文**的 `questionnaire`。
+v1 把它渲染成可回答的 Markdown（标题、问题、选项 label + 说明），
+**回复选项名即可继续** —— 与面板里的点击协议一致（面板点选项也是把 label 当消息发出去）。
+把它渲染成可点的卡片需要注册 Chat 行（`conversation.chat.node`）与自定义事件类型，
+而 practices 明确「不要用新的 session event 类型」，所以这一步留到以后再说。
+
+### 开关与配置
+
+| config | 默认 | 说明 |
+| --- | --- | --- |
+| `mentionEnabled` | `true` | `false` 时：两个 Host 监听不注册，`GET /mention-apps` 回 `bridge:false`，Client 的 `@` 分组随之消失（面板与工具不受影响） |
+| `mentionPickTtlMs` | `1800000` | 选中后多久之内发送算数（选中即解析应用，所以要等打字） |
+| `mentionIndexMs` | `60000` | 「已上架应用名 → appId」索引的复用时长 |
+
 ## 5. 浏览器通道
 
 > **主题 token 必须成对使用。** 面板最初的用户气泡和主按钮写的是
@@ -175,6 +231,8 @@ cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modu
 | `POST /adp-console/release` | 发布 `{appId, description?}` |
 | `POST /adp-console/release-status` | 查询最新发布状态 |
 | `POST /adp-console/verify` | 凭据体检：分别探测 身份核对 / 当前站点 ADP / 国际站 ADP，给出归因结论 |
+| `GET /adp-console/mention-apps` | `@` 菜单的候选：已上架（已上线）应用 + 出口行；无密钥时只回 `configured:false` |
+| `POST /adp-console/bind` | 记下「这次选中的是哪个应用」`{sessionId, appId\|null, token}`，等携带它的那条消息 |
 | `POST /adp-console/chat` | 会话，返回 `text/event-stream`（`console.delta` / `console.done` / `console.error` / `adp.event`；`console.done` 带 `transport`） |
 
 路由只接受 loopback 的 `Host`，因此不接受浏览器跨站请求；密钥永不出现在页面里。
@@ -187,7 +245,7 @@ cd adp-console && pnpm add tencentcloud-sdk-nodejs-adp   # 已装好；node_modu
 
 ```bash
 cd adp-console
-node test/self-test.mjs      # 49 项断言
+node test/self-test.mjs      # 152 项断言
 ```
 
 覆盖：TC3 签名（对齐腾讯云官方文档 cvm 示例的签名值）、工具注册、路由注册、
@@ -216,17 +274,20 @@ DSH_ADP_SITE=standalone node test/diagnose.mjs
 
 | 项 | 状态 |
 | --- | --- |
-| 自测 109 项 | 通过 |
+| 自测 152 项 | 通过 |
 | TC3 签名 vs 官方文档向量 | 逐字节一致 |
 | `capi.adp.tencent.com` 连通性 | **已实测**：请求被接受并返回独立站自己的业务错误格式 `450203-ErrSecretNotFound` |
 | `adp.tencent.com/adp/v2/chat` 对话端点 | **已实测**：`200 text/event-stream`，返回标准 `error` 事件 |
 | 腾讯云站 / 国际站连通性 | **已实测**：返回 `AuthFailure.SecretIdNotFound` |
 | 线上实例已切到独立站 | **已确认**：`endpoint=capi.adp.tencent.com`、`chatEndpoint=https://adp.tencent.com/adp/v2/chat`、`wsEndpoint=wss://wss.lke.cloud.tencent.com/adp/v2/chat/conn/` |
 | 线上路由 `/adp-console/*` | **已实测 200**（冷启动竞态修复后） |
-| 线上工具注册（4 个） | 已确认 |
+| 线上工具注册（5 个） | 已确认 |
 | 线上路由 `/config` `/apps` `/enabled` `POST /config` | 已确认 |
 | 线上客户端面板两个 slot（`sidebar.panellist` + `main`） | 已确认注册且 active |
 | 面板实际渲染 | **未验证**：读不到浏览器控制台，需你刷新页面点开面板确认 |
+| `@` 菜单（Client）实际渲染 | **未验证**：同上。自测直接求值线上 `client.js` 的模块工厂并驱动真实 source（候选、筛选、选中、codec、`/bind`） |
+| `@` 桥接（Host） | **离线实测通过**：自测驱动真实 `agent/pre-step` 与 `llm/stream` waterfall，拿到 mock 回复、表单渲染、粘性续聊、`@DSH` 退出、下架拦截等 30 项断言 |
+| `@` 桥接（真实 ADP 应用 + 真实浏览器） | **未验证**：需要你在页面上真发一条 `@应用名` 的消息 |
 | 真实 ADP 清单 | **已实测通过**：独立站 `capi.adp.tencent.com` 返回真实应用 `clawagent_demo`（ClawAgent 模式，运行中） |
 | 真实上架 / 下架 | **已实测通过**：开关写入 `state.json` 并在重新拉取后保持 |
 | 真实会话 | **已打通**：SSE 报 `460004` 时自动回退 WebSocket，4.1s 拿到真实回复 |
@@ -296,6 +357,30 @@ WS 握手（按文档实现，Socket.IO v4）：
 
 回退策略很克制：`460048 应用未发布`（WS 也救不了）和网络类失败**不会**触发回退，只有
 `460004`/`460033`（对话服务查不到应用）才回退。可用 `chatTransport: sse|ws|auto` 强制指定。
+
+### 多轮回复的分段
+
+一个回合**不是一条消息**。Claw 智能体把每一步播报成各自的 `reply`
+（「第一批资料已获取。」「继续搜索验证关键数据与产品信息。」…），而原来的
+`extractFinalText` 只是把各条文本首尾相接：
+
+```js
+for (const message of messages) { for (const content of message.Contents) out += content.Text }
+```
+
+结果就是一整段连在一起的「墙」，句子之间连分隔都没有 —— 例如
+「…挑战方面的**资料资料**已较充分」（两条消息的接缝）。
+
+现在按消息分片：
+
+- reducer 用 `Map<MessageId, text>` 保存每个 `reply` 的文本，最后用**空行**连接。
+  `text.replace` 只替换**该条消息**的文本，不再清掉整段（原来 `delta = chunk` 会误伤）。
+- 流式阶段同样带分隔：新消息的第一个 delta 会前置 `\n\n`，所以边流边看就是分好段的，
+  不用等终态帧。
+- 没有文本的消息（questionnaire、file）不产生空段落；单条 reply 不会被多加空行。
+
+自测里 mock 增加了一个返回两条 reply 的分支，断言最终文本与流式增量都得到
+`"第一批资料已获取。\n\n继续搜索验证关键数据。"`。
 
 ### 面板状态：切换功能再切回来不清空
 
@@ -477,8 +562,8 @@ Agent 还在干活，就不会被判定超时。
 | `package.json` | bundle 清单（`dsh.bundle.patch` + `dsh.client`），无任何运行时依赖 |
 | `cordis.patch.yml` | profile 里插入的那一行 |
 | `lib/entry.js` | bundle 入口（稳定壳）：每次激活用带 `?rev=` 的动态 import 加载实现，使改动无需重启即可生效 |
-| `lib/impl.js` | Host 半实现：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话、超时治理与人在回环组件抽取 |
-| `client.js` | Client 半：侧边栏图标 + 主面板页面 + 流式会话 |
+| `lib/impl.js` | Host 半实现：官方 SDK / 内置 TC3 签名、ADP OpenAPI 客户端、上架开关、5 个工具、浏览器路由、SSE+WS 会话、超时治理、人在回环组件抽取，以及 `@` 桥接（`agent/pre-step` 绑定 + `llm/stream` 路由） |
+| `client.js` | Client 半：侧边栏图标 + 主面板页面 + 流式会话 + `@` 引用源（`inputTriggers`，name=`adp`） |
 | `locale/zh.json`、`locale/en.json` | 插件卡片的标题与描述 |
 | `icon.svg` | 侧边栏与插件卡片图标 |
 | `test/self-test.mjs` | 自测（不随 bundle 发布） |

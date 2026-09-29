@@ -1,9 +1,9 @@
 {
   "name": "@local/adp-console",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
-  "description": "Browse published Tencent Cloud ADP agent apps, publish or unpublish them, and chat with a published app over the ADP conversation API.",
+  "description": "Browse published Tencent Cloud ADP agent apps, publish or unpublish them, and talk to an enabled app from the panel or by @-mentioning it in a session.",
   "icon": "./icon.svg",
   "exports": {
     ".": "./lib/entry.js",
@@ -27,7 +27,8 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar"
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-input-trigger"
       ]
     }
   },

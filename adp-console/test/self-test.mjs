@@ -49,6 +49,8 @@ let lastVersion = ''
 let lastRequestClient = null
 let lastPayload = null
 let lastConversationRequest = null
+/** How many times the turn had to open a conversation, so reuse stays observable. */
+let conversationCreateCount = 0
 
 const gateway = createServer((req, res) => {
   const chunks = []
@@ -116,6 +118,7 @@ const gateway = createServer((req, res) => {
       case 'CreateConversation':
         // The documented prerequisite: Type=5 (API 接入) and the app's own AppKey.
         lastConversationRequest = lastPayload
+        conversationCreateCount += 1
         if (lastPayload?.AppKey !== APP_KEY) {
           reply({ Error: { Code: 'FailedOperation', Message: '400-请求参数错误, 请参阅接入文档.' } })
           return
@@ -158,6 +161,27 @@ function chatResponse(rawBody, res) {
   const frame = payload => res.write(`data: ${JSON.stringify(payload)}\n\n`)
   frame({ Type: 'request_ack', RequestId: body?.RequestId })
   frame({ Type: 'response.created', RecordId: 'r1' })
+  // A Claw agent narrates each step as its own reply; two of them must not be glued.
+  if (body?.Contents?.[0]?.Text === 'MULTI') {
+    frame({ Type: 'message.added', MessageId: 's1', Message: { Type: 'reply', MessageId: 's1', Contents: [{ Type: 'text' }] } })
+    frame({ Type: 'text.delta', MessageId: 's1', Text: '第一批资料已获取。' })
+    frame({ Type: 'message.added', MessageId: 's2', Message: { Type: 'reply', MessageId: 's2', Contents: [{ Type: 'text' }] } })
+    frame({ Type: 'text.delta', MessageId: 's2', Text: '继续搜索验证关键数据。' })
+    frame({
+      Type: 'response.completed',
+      Response: {
+        RecordId: 'r1',
+        Messages: [
+          { Type: 'reply', MessageId: 's1', Contents: [{ Type: 'text', Text: '第一批资料已获取。' }] },
+          { Type: 'reply', MessageId: 's2', Contents: [{ Type: 'text', Text: '继续搜索验证关键数据。' }] },
+        ],
+      },
+    })
+    res.write('event: done\ndata: [DONE]\n\n')
+    res.end()
+    globalThis.__lastChatBody = body
+    return
+  }
   frame({ Type: 'message.added', MessageId: 'm1', Message: { Type: 'thought', MessageId: 'm1', Contents: [{ Type: 'text' }] } })
   frame({ Type: 'text.delta', MessageId: 'm1', Text: THOUGHT_TEXT })
   frame({ Type: 'message.done', MessageId: 'm1' })
@@ -216,6 +240,7 @@ function createHarness({ webServer = true } = {}) {
   const tools = new Map()
   const routes = []
   const waiting = []
+  const listeners = new Map()
   const webCtx = {
     effect(callback) {
       const dispose = callback()
@@ -242,6 +267,20 @@ function createHarness({ webServer = true } = {}) {
     inject(dependencies, callback) {
       if (mounted && dependencies.includes('webServer')) callback(webCtx)
       else waiting.push({ dependencies, callback })
+    },
+    /**
+     * The plugin-owned Event registrations. `agent/pre-step` and `llm/stream` are
+     * waterfalls, so the harness has to dispatch them like Cordis: registration order,
+     * each listener owning the decision and calling `next()` to reach the next one.
+     */
+    on(name, handler) {
+      const list = listeners.get(name) ?? []
+      list.push(handler)
+      listeners.set(name, list)
+      return () => {
+        const at = list.indexOf(handler)
+        if (at >= 0) list.splice(at, 1)
+      }
     },
     tools: {
       register(definition) {
@@ -271,7 +310,19 @@ function createHarness({ webServer = true } = {}) {
     return { json: JSON.parse(text), status: res.statusCode }
   }
 
-  return { ctx, tools, routes, call, provideWebServer }
+  /** Run one waterfall; `inner` is what the innermost `next()` resolves to. */
+  function waterfall(name, payload, inner) {
+    const list = listeners.get(name) ?? []
+    const run = index => (index >= list.length ? inner() : list[index](payload, () => run(index + 1)))
+    return run(0)
+  }
+
+  /** Dispatch one emit-mode Event. */
+  function emitEvent(name, ...args) {
+    for (const handler of listeners.get(name) ?? []) handler(...args)
+  }
+
+  return { ctx, tools, routes, call, provideWebServer, waterfall, emitEvent, listeners }
 }
 
 /** Minimal `IncomingMessage`. */
@@ -1178,6 +1229,350 @@ check(
       && storeFactory.chatStore('keep-b').get().draft === 'typing'
   })(),
 )
+
+/* --- 18. One turn, several replies, separated paragraphs --- */
+// Each narration step is its own `reply` message; joining them without a separator
+// produced the run-on wall of text the panel used to show.
+const streamed = []
+const multi = await mod.runAdpChat({
+  transport: 'sse',
+  endpoint: `http://${origin}/adp/v2/chat`,
+  appKey: 'k',
+  message: 'MULTI',
+  userId: 'u',
+  conversationId: 'c'.repeat(32),
+  onEvent: (name, payload, text) => { if (text !== '') streamed.push(text) },
+})
+check(
+  'separate replies become separate paragraphs',
+  multi.text === '第一批资料已获取。\n\n继续搜索验证关键数据。',
+  JSON.stringify(multi.text),
+)
+check(
+  'the streamed deltas carry the paragraph break too',
+  streamed.join('') === multi.text,
+  JSON.stringify(streamed),
+)
+check(
+  'a single reply is not given a spurious break',
+  structured.text === REPLY_TEXT,
+  JSON.stringify(structured.text),
+)
+
+/* --- 19. The `@` mention bridge: one prompt, one ADP app --- */
+// The second conversation path. `@` an enabled app and the turn is answered by that
+// app through the documented `llm/stream` routing seam instead of by the model. The
+// prompt carries only the readable `@name`; the id arrives out of band at pick time,
+// and a hand-typed `@name` falls back to the enabled-app index.
+const mentionHarness = createHarness()
+mod.apply(mentionHarness.ctx, {
+  secretId: 'AKIDmention', secretKey: 'SECRETmention', region: 'ap-guangzhou', spaceId: 'default_space',
+  site: 'standalone', endpoint: origin, chatEndpoint: `http://${origin}/adp/v2/chat`, wsEndpoint: '',
+  protocol: 'http', apiVersion: '2026-05-20', routePrefix: '/adp-console',
+  statePath: join(stateDir, 'state-mention.json'), defaultEnabledAppIds: [APP_RUNNING],
+  requestTimeoutMs: 10000, releaseTimeoutMs: 5000, appKeyCacheMs: 300000,
+  exposeTools: false, chatTransport: 'sse',
+})
+
+check('the `@` bridge is on by default', mod.DEFAULT_CONFIG.mentionEnabled === true)
+check(
+  'a multi-word app name becomes one mention token',
+  mod.mentionToken('Customer Service Bot') === 'Customer-Service-Bot',
+  mod.mentionToken('Customer Service Bot'),
+)
+check('an unnamed app falls back to its id', mod.mentionToken('', APP_RUNNING) === APP_RUNNING)
+check(
+  'mentions are whitespace-bounded, exactly as the Chat view decorates them',
+  mod.mentionTokensIn('@客服助手 你好，@DSH').map(token => token.name).join('|') === '客服助手',
+  JSON.stringify(mod.mentionTokensIn('@客服助手 你好，@DSH')),
+)
+check('removing a mention leaves the prose', mod.removeMentionToken('@客服助手 帮我看下数据', '客服助手') === '帮我看下数据')
+
+const mentionApps = await mentionHarness.call('GET', '/mention-apps')
+check(
+  'GET /mention-apps lists the enabled, running apps by their mention token',
+  mentionApps.json.ok === true && mentionApps.json.apps.length === 1
+    && mentionApps.json.apps[0].appId === APP_RUNNING && mentionApps.json.apps[0].token === '客服助手',
+  JSON.stringify(mentionApps.json),
+)
+check('GET /mention-apps offers the way out of ADP mode', mentionApps.json.exit?.token === 'DSH', JSON.stringify(mentionApps.json.exit))
+check(
+  'the menu copy stays localizable instead of being stringified',
+  mentionApps.json.apps[0].adpStatus === 2
+    && mentionApps.json.apps[0].adpStatusLabel?.zh === '已上线'
+    && mentionApps.json.apps[0].appModeLabel?.zh === 'Agent 模式',
+  JSON.stringify(mentionApps.json.apps[0]),
+)
+check(
+  'without credentials the @ menu reports that instead of failing',
+  (await secondary.call('GET', '/mention-apps')).json.configured === false,
+)
+
+const SESSION = 'session-mention-1'
+const bind = await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: SESSION, appId: APP_RUNNING, token: '客服助手' }))
+check('POST /bind arms an enabled app', bind.json.ok === true && bind.json.appId === APP_RUNNING, JSON.stringify(bind.json))
+check(
+  'POST /bind refuses an app that is not 上架',
+  (await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: 'session-unarmed', appId: APP_OFFLINE, token: '知识问答' }))).json.ok === false,
+)
+
+const userOf = (id, text) => ({ id, source: { kind: 'user' }, content: [{ type: 'text', text }] })
+const preStep = (harness, sessionId, messages) => harness.waterfall(
+  'agent/pre-step',
+  { agent: { session: { id: sessionId } }, messages, turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages }),
+)
+const collect = async (iterable) => {
+  const chunks = []
+  for await (const chunk of await iterable) chunks.push(chunk)
+  return chunks
+}
+/** Drive one model call; `fellThrough` records that the adapter was asked instead. */
+async function streamTurn(harness, sessionId, overrides = {}) {
+  let fellThrough = false
+  const chunks = await collect(harness.waterfall(
+    'llm/stream',
+    { provider: 'deepseek-official', model: 'test', sessionId, messages: [], ...overrides },
+    () => {
+      fellThrough = true
+      return (async function* () { yield { type: 'finish', reason: { kind: 'stop' } } })()
+    },
+  ))
+  return { chunks, fellThrough }
+}
+const textOf = chunks => chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text).join('')
+
+const firstDecision = await preStep(mentionHarness, SESSION, [userOf('m1', '@客服助手 帮我看下数据')])
+check(
+  'the mention never reaches the model prompt',
+  mod.messageTextOf(firstDecision.messages[0]) === '帮我看下数据',
+  JSON.stringify(mod.messageTextOf(firstDecision.messages[0])),
+)
+check('the pre-step keeps its own decision shape', firstDecision.kind === 'enter' && firstDecision.messages.length === 1)
+
+const createsBefore = conversationCreateCount
+const firstTurn = await streamTurn(mentionHarness, SESSION)
+check(
+  'the turn is answered by the ADP app, not by the model',
+  firstTurn.fellThrough === false && textOf(firstTurn.chunks).includes(REPLY_TEXT),
+  textOf(firstTurn.chunks).slice(0, 120),
+)
+check(
+  'the ADP turn received the prose without its mention',
+  globalThis.__lastChatBody?.Contents?.[0]?.Text === '帮我看下数据',
+  JSON.stringify(globalThis.__lastChatBody?.Contents),
+)
+check(
+  'the bridged turn opens one ADP conversation',
+  conversationCreateCount === createsBefore + 1 && globalThis.__lastChatBody?.ConversationId === CONVERSATION_ID,
+  `creates=${conversationCreateCount - createsBefore}`,
+)
+check(
+  'the end user is stable per session, not per turn',
+  typeof globalThis.__lastChatBody?.UserId === 'string' && globalThis.__lastChatBody.UserId.startsWith('dsh'),
+  String(globalThis.__lastChatBody?.UserId),
+)
+check(
+  'the reply streams as the documented chunk vocabulary',
+  firstTurn.chunks[0].type === 'block-start'
+    && firstTurn.chunks.at(-1).type === 'finish' && firstTurn.chunks.at(-1).reason.kind === 'stop'
+    && firstTurn.chunks.some(chunk => chunk.type === 'block-end' && chunk.block.type === 'text' && chunk.block.text.includes(REPLY_TEXT)),
+  JSON.stringify(firstTurn.chunks.map(chunk => chunk.type)),
+)
+check(
+  'a human-in-the-loop form is rendered as answerable text',
+  textOf(firstTurn.chunks).includes('插图方式') && textOf(firstTurn.chunks).includes('AI 生成插图（推荐）'),
+  textOf(firstTurn.chunks).slice(-160),
+)
+
+await preStep(mentionHarness, SESSION, [userOf('m2', '再详细一点')])
+const followTurn = await streamTurn(mentionHarness, SESSION)
+check(
+  'a follow-up with no mention stays with the same app',
+  followTurn.fellThrough === false && textOf(followTurn.chunks).includes(REPLY_TEXT),
+  textOf(followTurn.chunks).slice(0, 80),
+)
+check(
+  'the follow-up reuses the conversation it opened',
+  conversationCreateCount === createsBefore + 1,
+  `creates=${conversationCreateCount - createsBefore}`,
+)
+const titled = await streamTurn(mentionHarness, SESSION, { purpose: 'session-title' })
+check('an auxiliary model call is never routed to the app', titled.fellThrough === true)
+
+await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: SESSION, appId: null, token: 'DSH' }))
+const exitDecision = await preStep(mentionHarness, SESSION, [userOf('m3', '@DSH 你好')])
+check(
+  'the exit mention is stripped from the prompt too',
+  mod.messageTextOf(exitDecision.messages[0]) === '你好',
+  JSON.stringify(mod.messageTextOf(exitDecision.messages[0])),
+)
+const exited = await streamTurn(mentionHarness, SESSION)
+check('after the exit the model owns the turn again', exited.fellThrough === true)
+
+// A mention typed or pasted by hand has no pick behind it; the enabled-app index is
+// what keeps it working, which is also what makes a mention survive being copied.
+const typed = await preStep(mentionHarness, 'session-mention-typed', [userOf('t1', '@客服助手 你好')])
+check('a hand-typed mention resolves against the enabled apps', mod.messageTextOf(typed.messages[0]) === '你好')
+const typedTurn = await streamTurn(mentionHarness, 'session-mention-typed')
+check('...and routes to the same app', typedTurn.fellThrough === false && textOf(typedTurn.chunks).includes(REPLY_TEXT))
+
+// `@DSH` typed by hand is the same exit the menu row performs.
+const typedExit = await preStep(mentionHarness, 'session-mention-typed', [userOf('t2', '@DSH 换我问你')])
+check(
+  'a hand-typed @DSH also releases the session',
+  mod.messageTextOf(typedExit.messages[0]) === '换我问你' && (await streamTurn(mentionHarness, 'session-mention-typed')).fellThrough === true,
+)
+
+// 下架 after the bind: the gate outranks the binding, and the answer says why.
+await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: 'session-mention-off', appId: APP_RUNNING, token: '客服助手' }))
+await preStep(mentionHarness, 'session-mention-off', [userOf('d1', '@客服助手 你好')])
+await mentionHarness.call('POST', '/enabled', JSON.stringify({ appId: APP_RUNNING, enabled: false }))
+const offTurn = await streamTurn(mentionHarness, 'session-mention-off')
+check(
+  'a 下架 app answers with the gate message instead of a reply',
+  offTurn.fellThrough === false && textOf(offTurn.chunks).includes('未上架'),
+  textOf(offTurn.chunks).slice(0, 140),
+)
+await mentionHarness.call('POST', '/enabled', JSON.stringify({ appId: APP_RUNNING, enabled: true }))
+
+// `mentionEnabled: false` removes the Host listeners and tells the Client to drop the
+// menu group, so nothing can insert a mention that no longer resolves.
+const offHarness = createHarness()
+mod.apply(offHarness.ctx, {
+  secretId: 'AKIDoff', secretKey: 'SECREToff', region: 'ap-guangzhou', spaceId: 'default_space',
+  site: 'standalone', endpoint: origin, chatEndpoint: `http://${origin}/adp/v2/chat`, protocol: 'http',
+  apiVersion: '2026-05-20', routePrefix: '/adp-console', statePath: join(stateDir, 'state-mention-off.json'),
+  defaultEnabledAppIds: [APP_RUNNING], requestTimeoutMs: 10000, releaseTimeoutMs: 5000,
+  appKeyCacheMs: 1000, exposeTools: false, mentionEnabled: false,
+})
+const offRoute = await offHarness.call('GET', '/mention-apps')
+check('mentionEnabled:false tells the Client to drop the @ group', offRoute.json.bridge === false)
+await preStep(offHarness, 'session-mention-disabled-bridge', [userOf('o1', '@客服助手 你好')])
+check(
+  'mentionEnabled:false leaves the model owning every turn',
+  (await streamTurn(offHarness, 'session-mention-disabled-bridge')).fellThrough === true,
+)
+
+/* --- 20. The Client `@` source --- */
+// `client.js` is plain JavaScript the page evaluates through its module table, so this
+// runs the shipped source: whatever it registers here is what the composer will see.
+let handoff
+const previousWindow = globalThis.window
+globalThis.window = { __ModuleLoader__: { load: registration => { handoff = registration } } }
+await import(`${pathToFileURL(join(here, '..', 'client.js')).href}?rev=${Date.now()}`)
+globalThis.window = previousWindow
+check(
+  'the client registers its module factory',
+  handoff?.id === '@local/adp-console' && typeof handoff?.factory === 'function',
+  String(handoff?.id),
+)
+
+const reactStub = {
+  createElement: () => null,
+  createContext: () => ({ Provider: () => null, Consumer: () => null }),
+  useState: value => [typeof value === 'function' ? value() : value, () => {}],
+  useEffect: () => {},
+  useCallback: fn => fn,
+  useMemo: fn => fn(),
+  useRef: value => ({ current: value ?? null }),
+  useSyncExternalStore: () => undefined,
+  Fragment: 'Fragment',
+}
+const clientPlugin = handoff.factory((id) => {
+  if (id === 'react') return reactStub
+  throw new Error(`unexpected require(${JSON.stringify(id)})`)
+})
+const sources = []
+const inputTriggers = { registerSource(source) { sources.push(source); return () => {} } }
+const clientCtx = {
+  effect(callback) { const dispose = callback(); return typeof dispose === 'function' ? dispose : () => {} },
+  get(name) { return name === 'inputTriggers' ? inputTriggers : undefined },
+  inject(_dependencies, callback) { callback({ ...clientCtx, inputTriggers }) },
+  on() { return () => {} },
+  locale: { register() {}, bind: () => key => key },
+  slots: { inject() {}, register: () => () => {} },
+}
+clientPlugin.apply(clientCtx)
+check(
+  'applying the client half registers one `@` source',
+  sources.length === 1 && sources[0].trigger === '@' && sources[0].name === 'adp',
+  `${sources.length} source(s)`,
+)
+
+const realFetch = globalThis.fetch
+const clientCalls = []
+globalThis.fetch = async (url, options) => {
+  const target = String(url)
+  clientCalls.push({ target, options })
+  const json = value => ({ ok: true, status: 200, json: async () => value })
+  if (target === '/adp-console/mention-apps') {
+    return json({
+      ok: true,
+      configured: true,
+      apps: [{ appId: APP_RUNNING, name: '客服助手', token: '客服助手', appModeLabel: { zh: 'Agent 模式' }, adpStatus: 2 }],
+      exit: { token: 'DSH', label: 'DSH 本体' },
+    })
+  }
+  if (target === '/adp-console/bind') return json({ ok: true })
+  return realFetch(url, options)
+}
+try {
+  const source = sources[0]
+  const session = { sessionId: 's-client' }
+  const rows = await source.candidates(session, { query: '', signal: new AbortController().signal, position: 'inline', drilled: false })
+  check(
+    'the @ menu offers the enabled app and a way back to DSH',
+    rows.length === 2 && rows[0].name === '客服助手' && rows[1].name === 'DSH 本体',
+    JSON.stringify(rows.map(row => row.name)),
+  )
+  const filtered = await source.candidates(session, { query: '知识', signal: new AbortController().signal, position: 'inline', drilled: false })
+  check(
+    'the @ menu filters by name',
+    filtered.length === 1 && JSON.parse(filtered[0].value).kind === 'exit',
+    JSON.stringify(filtered.map(row => row.name)),
+  )
+  check(
+    'the menu describes the app without stringifying its labels',
+    typeof rows[0].description === 'string' && rows[0].description.includes('Agent 模式')
+      && !rows[0].description.includes('[object'),
+    String(rows[0].description),
+  )
+  const pick = source.onPick({ candidate: rows[0], session, position: 'inline', via: 'menu', action: 'pick', span: {} })
+  check(
+    'a pick inserts a chip labelled with the app name',
+    pick?.insert?.appearance === 'session' && pick.insert.label === '客服助手' && pick.insert.source === 'adp',
+    JSON.stringify(pick),
+  )
+  check(
+    'the chip serializes to the readable @name the Host resolves',
+    await source.codec.serialize(pick.insert.ref, new AbortController().signal) === '@客服助手',
+    pick.insert.ref,
+  )
+  const bindCall = clientCalls.find(call => call.target === '/adp-console/bind')
+  check(
+    'the pick tells the Host which app it means, before the message is sent',
+    bindCall !== undefined
+      && JSON.parse(bindCall.options.body).appId === APP_RUNNING
+      && JSON.parse(bindCall.options.body).sessionId === 's-client',
+    JSON.stringify(bindCall?.options?.body),
+  )
+  const exitPick = source.onPick({ candidate: rows[1], session, position: 'inline', via: 'menu', action: 'pick', span: {} })
+  check(
+    'the exit row clears the binding and serializes to @DSH',
+    await source.codec.serialize(exitPick.insert.ref, new AbortController().signal) === '@DSH'
+      && JSON.parse(clientCalls.filter(call => call.target === '/adp-console/bind').at(-1).options.body).appId === null,
+  )
+  check(
+    'a hint row inserts nothing',
+    source.onPick({
+      candidate: { name: 'hint', value: JSON.stringify({ kind: 'hint' }) },
+      session, position: 'inline', via: 'menu', action: 'pick', span: {},
+    }) === 'handled',
+  )
+} finally {
+  globalThis.fetch = realFetch
+}
 
 gateway.close()
 

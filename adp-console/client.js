@@ -108,6 +108,11 @@ window.__ModuleLoader__.load({
       copied: '已复制',
       total: '共 {n} 个应用',
       enabledCount: '已上架 {n} 个',
+      mentionSection: 'ADP 智能体',
+      mentionEmpty: '还没有已上架的 ADP 应用',
+      mentionEmptyEnabled: '先到「ADP 智能体」面板把应用上架，再回到这里 @ 它。',
+      mentionEmptyKey: '先到「ADP 智能体」面板填写腾讯云密钥。',
+      mentionExitHint: '结束 ADP 会话，把这条会话交回 DSH 本体。',
     };
 
     const en = {
@@ -195,6 +200,11 @@ window.__ModuleLoader__.load({
       copied: 'Copied',
       total: '{n} apps',
       enabledCount: '{n} enabled',
+      mentionSection: 'ADP agents',
+      mentionEmpty: 'No ADP agent is enabled',
+      mentionEmptyEnabled: 'Enable an app in the ADP 智能体 panel first, then @ it here.',
+      mentionEmptyKey: 'Save a Tencent Cloud key pair in the ADP 智能体 panel first.',
+      mentionExitHint: 'Leave the ADP conversation and hand this session back to DSH.',
     };
 
     const CSS = [
@@ -999,6 +1009,186 @@ window.__ModuleLoader__.load({
      */
     let lastSelectedAppId = '';
 
+    /* ------------------------------------------------------------------ *
+     * `@` mention source
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The source name the composer records on every chip it inserts. The submit path
+     * asks the registered source for `codec.serialize`, so this is what turns a chip
+     * into the `@name` the Host binds the session from.
+     */
+    const MENTION_SOURCE = 'adp';
+
+    /**
+     * The source's dictionary, bound when the plugin applies. The menu is built
+     * outside the panel's React context, so it cannot read `AdpContext`.
+     */
+    let mentionText = key => key;
+
+    /**
+     * The `@` targets of the current gate: enabled apps, a terminating exit row, and
+     * the copy the empty states need. Fetched lazily and shared by every session in the
+     * page, because the gate is process-wide.
+     */
+    let mentionTargets = null;
+    let mentionFetch = null;
+
+    /** The gate (or the credentials) changed: the next menu reflects it. */
+    function invalidateMentions() {
+      mentionTargets = null;
+      mentionFetch = null;
+    }
+
+    /** One `GET /mention-apps`, shared by concurrent keystrokes. */
+    function loadMentionTargets() {
+      if (mentionTargets !== null) return Promise.resolve(mentionTargets);
+      if (mentionFetch === null) {
+        mentionFetch = api('/mention-apps')
+          .then((payload) => {
+            mentionTargets = {
+              apps: Array.isArray(payload.apps) ? payload.apps : [],
+              configured: payload.configured === true,
+              bridge: payload.bridge !== false,
+              exit: payload.exit && typeof payload.exit === 'object' ? payload.exit : { token: 'DSH', label: 'DSH' },
+            };
+            return mentionTargets;
+          })
+          .finally(() => { mentionFetch = null; });
+      }
+      return mentionFetch;
+    }
+
+    /** The pick payload one menu row carries. */
+    function mentionValue(value) {
+      try { return JSON.parse(value || ''); } catch { return null; }
+    }
+
+    /** The name a chip shows and the Host resolves: one whitespace-free word. */
+    function mentionName(app) {
+      return String(app.token || app.name || app.appId || '').trim();
+    }
+
+    /**
+     * The menu's secondary line: app mode plus ADP status. ADP sends both labels as
+     * `{zh, en}` dictionaries (the panel reads `.zh`); the status has its own locale
+     * key, so the status half follows the active locale.
+     */
+    function mentionDescription(app, t) {
+      const mode = app.appModeLabel?.zh || '';
+      const statusKey = ADP_STATUS_KEY[app.adpStatus];
+      const status = statusKey === undefined ? (app.adpStatusLabel?.zh || '') : t(statusKey);
+      return [mode, status].filter(Boolean).join(' · ') || undefined;
+    }
+
+    const adpMentionSource = {
+      trigger: '@',
+      name: MENTION_SOURCE,
+      order: 5,
+      showGroupTitle: false,
+      async candidates(session, { query, signal }) {
+        const targets = await loadMentionTargets();
+        // The Host half can be switched off (`mentionEnabled: false`); then this group
+        // contributes nothing at all rather than inserting mentions nothing resolves.
+        if (targets.bridge === false) return [];
+        // A superseded keystroke reads the warm cache next time; never race it.
+        if (signal.aborted) return [];
+        const t = mentionText;
+        const needle = String(query || '').toLowerCase();
+        const rows = targets.apps
+          .filter(app => needle === ''
+            || String(app.name || '').toLowerCase().includes(needle)
+            || String(app.appId || '').includes(needle))
+          .map(app => ({
+            name: app.name || app.appId,
+            description: mentionDescription(app, t),
+            icon: 'session',
+            section: t('mentionSection'),
+            value: JSON.stringify({ kind: 'app', appId: app.appId, token: mentionName(app), label: app.name || app.appId }),
+          }));
+        rows.push({
+          name: targets.exit.label || 'DSH',
+          description: t('mentionExitHint'),
+          icon: 'session',
+          section: t('mentionSection'),
+          value: JSON.stringify({ kind: 'exit', token: targets.exit.token || 'DSH' }),
+        });
+        if (targets.apps.length === 0) {
+          rows.unshift({
+            name: t('mentionEmpty'),
+            description: targets.configured ? t('mentionEmptyEnabled') : t('mentionEmptyKey'),
+            section: t('mentionSection'),
+            value: JSON.stringify({ kind: 'hint' }),
+          });
+        }
+        return rows;
+      },
+      warm() {
+        // Fill the menu before the first `@` without blocking anything.
+        void loadMentionTargets().catch(() => {});
+      },
+      onPick({ candidate, session }) {
+        const value = mentionValue(candidate.value);
+        if (value === null || value.kind === 'hint') return 'handled';
+        const appId = value.kind === 'exit' ? null : String(value.appId || '');
+        const token = String(value.token || '').replace(/^@/, '');
+        if (token === '') return 'handled';
+        // The prompt carries only the readable `@name`; the id has to reach the Host
+        // before the message does, or the Host would have to guess an app from a label.
+        void api('/bind', {
+          method: 'POST',
+          body: JSON.stringify({ sessionId: session.sessionId, appId, token }),
+        }).catch(() => {});
+        return {
+          insert: {
+            source: MENTION_SOURCE,
+            // Self-contained: the codec only ever receives this string back.
+            ref: JSON.stringify({ appId, token }),
+            label: value.label || token,
+            appearance: 'session',
+            clipboardText: `@${token}`,
+          },
+        };
+      },
+      /**
+       * A chip's `ref` is opaque to the pipeline and this is the only thing the codec
+       * receives, so the ref is the pick payload itself: what the model reads is the
+       * `@name`, and what the clipboard keeps is the same mention in plain text.
+       */
+      codec: {
+        clipboardText(ref) {
+          const value = mentionValue(ref);
+          return value === null ? ref : `@${value.token}`;
+        },
+        serialize(ref) {
+          const value = mentionValue(ref);
+          return Promise.resolve(value === null ? ref : `@${value.token}`);
+        },
+      },
+    };
+
+    /**
+     * Register the source once the input pipeline exists. `ctx.inject` parks the
+     * registration until the service is there (a cold page can apply this plugin before
+     * the composer does); the direct lookup covers a context without that helper.
+     */
+    function registerMentionSource(ctx) {
+      const register = triggerCtx => triggerCtx.effect(
+        () => triggerCtx.inputTriggers.registerSource(adpMentionSource),
+        'adp-console: @ source',
+      );
+      if (typeof ctx.inject === 'function') {
+        ctx.inject(['inputTriggers'], register);
+        return;
+      }
+      const inputTriggers = ctx.get('inputTriggers');
+      if (inputTriggers === undefined) {
+        console.error('[adp-console] inputTriggers 不可用，@ 菜单入口未注册。');
+        return;
+      }
+      ctx.effect(() => inputTriggers.registerSource(adpMentionSource), 'adp-console: @ source');
+    }
+
     function AdpPage() {
       const ctx = React.useContext(AdpContext);
       const t = ctx.t;
@@ -1050,6 +1240,8 @@ window.__ModuleLoader__.load({
         try {
           await api('/enabled', { method: 'POST', body: JSON.stringify({ appId, enabled }) });
           setApps(previous => previous.map(app => (app.appId === appId ? { ...app, dshEnabled: enabled } : app)));
+          // 上架/下架 is exactly what the `@` menu lists.
+          invalidateMentions();
         } catch (cause) {
           setError(String(cause.message || cause));
         } finally {
@@ -1062,6 +1254,7 @@ window.__ModuleLoader__.load({
         try {
           await api('/release', { method: 'POST', body: JSON.stringify({ appId }) });
           await load();
+          invalidateMentions();
         } catch (cause) {
           setError(String(cause.message || cause));
         } finally {
@@ -1102,6 +1295,8 @@ window.__ModuleLoader__.load({
             t,
             onSaved: async () => {
               setShowSettings(false);
+              // New credentials mean a different catalogue behind the `@` menu too.
+              invalidateMentions();
               await load();
             },
             onClose: unconfigured ? null : () => setShowSettings(false),
@@ -1173,6 +1368,9 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'adp-console: dictionaries');
         const t = ctx.locale.bind(NS);
+        // The `@` menu is built outside the panel's React tree, so it needs its own binding.
+        mentionText = t;
+        registerMentionSource(ctx);
         ctx.slots.inject('main', () => ctx.slots.register({
           name: 'main',
           key: PANEL_ID,
