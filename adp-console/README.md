@@ -180,6 +180,28 @@ v1 把它渲染成可回答的 Markdown（标题、问题、选项 label + 说�
 把它渲染成可点的卡片需要注册 Chat 行（`conversation.chat.node`）与自定义事件类型，
 而 practices 明确「不要用新的 session event 类型」，所以这一步留到以后再说。
 
+### ADP 报文 → DSH 会话展示的字段映射
+
+| ADP 报文 | DSH 会话展示 |
+| --- | --- |
+| `Message.Type = thought` 的 `text.delta` | 折叠的「思考过程」（`reasoning` 块） |
+| `Message.Type = tool_call`（`ExtraInfo.ToolName` + `message.processing` 的 `Title`） | 思考过程里的一行 `🔧 工具：具体调用` |
+| `Message.Type = reply` | 正文（`text` 块，Markdown） |
+| `Content.Type = file` → `Content.File{FileName,FileUrl,FileSize,FileType}` | 复制到会话工作区 `adp-output/`，正文末尾「产出文件」列出**可点击预览的本地链接**（HTML/Office/PDF/代码在右侧栏打开），图片同时内联显示，附大小与类型、`原始下载` 链接 |
+| 正文里指向该文件的 COS 链接（签名会变） | 按 origin + path 匹配，改写为工作区路径，点击即本地预览 |
+| `Content.References[]`（`Name`/`DocName`/`DocRefer.Url`/`WebSearchRefer.Url`） | 「参考来源」编号链接列表 |
+| `questionnaire` | 见上一节 |
+
+文件元数据嵌套在 `Content.File` 里；早期实现读的是 `Content.FileName`/`Content.FileUrl`，
+真实报文里这两个字段不存在，于是只剩一行无名、无链接的「📄 产出文件」。`fileInfoOf()`
+按协议读取，旧的扁平写法保留为兜底。
+
+复制文件的安全边界：只允许 HTTPS、默认端口、`fileDownloadHosts` 中的域名（不接受 IP 字面量与
+URL 凭据）；**实际连接的解析地址**必须是公网地址（拒绝回环、私网、链路本地、组播、保留段及
+9/10/11/21/30 段），不跟随重定向；单文件受 `fileDownloadMaxBytes` 限制，超时即中止并删除半成品；
+文件名只取最后一段并清洗，目录经 realpath 校验不越出工作区，`wx` 独占创建、重名自动加后缀，
+从不覆盖已有文件。复制失败时保留原始下载链接并注明原因。
+
 ### 开关与配置
 
 | config | 默认 | 说明 |
@@ -187,6 +209,13 @@ v1 把它渲染成可回答的 Markdown（标题、问题、选项 label + 说�
 | `mentionEnabled` | `true` | `false` 时：两个 Host 监听不注册，`GET /mention-apps` 回 `bridge:false`，Client 的 `@` 分组随之消失（面板与工具不受影响） |
 | `mentionPickTtlMs` | `1800000` | 选中后多久之内发送算数（选中即解析应用，所以要等打字） |
 | `mentionIndexMs` | `60000` | 「已上架应用名 → appId」索引的复用时长 |
+| `mentionReasoning` | `true` | 把 `thought` / `tool_call` 映射进折叠的思考过程；`false` 时只保留正文 |
+| `fileDownload` | `true` | 把产出文件复制进会话工作区；`false` 时只列远程下载链接 |
+| `fileDownloadDir` | `adp-output` | 工作区内的相对目录 |
+| `fileDownloadHosts` | `["adp-cos.com","myqcloud.com"]` | 允许下载的 HTTPS 域名后缀 |
+| `fileDownloadMaxBytes` | `52428800` | 单文件上限（50 MB），超出保留远程链接 |
+| `fileDownloadTimeoutMs` | `60000` | 单文件下载超时 |
+| `fileDownloadMaxFiles` | `10` | 单轮最多复制的文件数 |
 
 ## 5. 浏览器通道
 

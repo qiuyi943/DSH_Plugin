@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    const { useCallback, useEffect, useRef, useState, useSyncExternalStore } = React;
+    const { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React;
 
     /** Locale namespace and the id shared by the sidebar entry and the main panel. */
     const NS = 'adpConsole';
@@ -100,6 +100,10 @@ window.__ModuleLoader__.load({
       conversation: '会话',
       events: 'ADP 事件',
       noEvents: '暂无事件',
+      appList: '应用列表',
+      thinking: '正在思考',
+      jumpLatest: '回到最新',
+      composeHint: 'Enter 发送 · Shift+Enter 换行',
       appId: '应用 ID',
       mode: '模式',
       human: '你',
@@ -194,6 +198,10 @@ window.__ModuleLoader__.load({
       conversation: 'Conversation',
       events: 'ADP events',
       noEvents: 'No event yet',
+      appList: 'Apps',
+      thinking: 'Thinking',
+      jumpLatest: 'Jump to latest',
+      composeHint: 'Enter to send · Shift+Enter for newline',
       appId: 'App id',
       mode: 'Mode',
       human: 'You',
@@ -212,7 +220,7 @@ window.__ModuleLoader__.load({
     };
 
     const CSS = [
-      '.adp-root{display:flex;flex-direction:column;height:100%;min-height:0;box-sizing:border-box;',
+      '.adp-root{display:flex;flex-direction:column;height:100%;min-height:0;box-sizing:border-box;overflow-y:auto;',
       'padding:20px 24px;gap:14px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);',
       "font-family:inherit;font-size:14px;line-height:1.5}",
       '.adp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex:0 0 auto}',
@@ -233,33 +241,42 @@ window.__ModuleLoader__.load({
       '.adp-btn:disabled{opacity:.5;cursor:default}',
       '.adp-btn.primary{color:var(--dsw-alias-label-primary-foreground);',
       'background:var(--dsw-alias-button-primary-fill,var(--dsw-alias-brand-primary));border-color:transparent}',
-      '.adp-body{display:grid;grid-template-columns:minmax(260px,320px) minmax(0,1fr);gap:14px;',
-      'align-items:start}',
-      'flex:1 1 auto;min-height:0}',
-      '@media (max-width:900px){.adp-body{grid-template-columns:minmax(0,1fr)}}',
+      // Two columns that fill the remaining height: the catalogue and the transcript each
+      // scroll on their own instead of growing the page.
+      '.adp-body{display:grid;grid-template-columns:minmax(240px,300px) minmax(0,1fr);gap:14px;',
+      'align-items:stretch;flex:1 1 auto;min-height:360px}',
+      '@media (max-width:900px){.adp-body{grid-template-columns:minmax(0,1fr);',
+      'grid-template-rows:minmax(0,220px) minmax(420px,1fr)}}',
       '.adp-card{display:flex;flex-direction:column;min-height:0;overflow:hidden;',
       'background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:10px}',
-      '.adp-cardhead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;',
+      '.adp-cardhead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;',
       'border-bottom:1px solid var(--dsw-alias-border-l1);font-size:13px;font-weight:600;flex:0 0 auto}',
-      '.adp-list{overflow-y:auto;min-height:0;flex:1 1 auto}',
+      '.adp-count{font-weight:400;font-size:12px;color:var(--dsw-alias-label-secondary)}',
+      '.adp-list{overflow-y:auto;min-height:0;flex:1 1 auto;padding:6px}',
+      '.adp-headtext{display:flex;flex-direction:column;gap:2px;min-width:0}',
       '.adp-headmain{display:flex;align-items:center;gap:6px;min-width:0}',
       '.adp-headname{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.adp-headmeta{display:flex;gap:10px;padding:6px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);',
-      'font-size:11px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}',
+      '.adp-headmeta{display:flex;gap:10px;min-width:0;font-size:11px;font-weight:400;',
+      'color:var(--dsw-alias-label-secondary)}',
       '.adp-headmeta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.adp-row{display:flex;align-items:center;flex-wrap:nowrap;gap:10px;padding:9px 12px;',
-      'border-bottom:1px solid var(--dsw-alias-border-l1);cursor:pointer}',
-      '.adp-tags{flex-wrap:nowrap;overflow:hidden}',
-      '.adp-row:last-child{border-bottom:none}',
-      '.adp-row:hover{background:var(--dsw-alias-bg-layer-2)}',
-      '.adp-row.sel{background:var(--dsw-alias-bg-layer-2)}',
+      // Catalogue row: avatar | name + meta | controls, on a single line.
+      '.adp-app{display:flex;flex-direction:row;align-items:center;gap:10px;padding:8px 10px;',
+      'border-radius:8px;cursor:pointer;outline:none;transition:background .12s ease}',
+      '.adp-app+.adp-app{margin-top:2px}',
+      '.adp-app:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '.adp-app:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-brand-primary) inset}',
+      '.adp-app.sel{background:var(--dsw-alias-bg-layer-2);',
+      'box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary)}',
       '.adp-avatar{width:32px;height:32px;border-radius:8px;object-fit:cover;flex:0 0 auto;',
-      'background:var(--dsw-alias-bg-layer-2)}',
-      '.adp-main{min-width:0;flex:1 1 auto}',
-      '.adp-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '.adp-meta{margin-top:2px;font-size:11px;color:var(--dsw-alias-label-secondary);',
+      'display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;',
+      'color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2)}',
+      '.adp-main{min-width:0;flex:1 1 auto;display:flex;flex-direction:column;gap:2px}',
+      '.adp-nameline{display:flex;align-items:center;gap:6px;min-width:0}',
+      '.adp-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}',
+      '.adp-meta{font-size:11px;color:var(--dsw-alias-label-secondary);',
       'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.adp-tags{display:flex;align-items:center;gap:6px;flex:0 0 auto}',
+      '.adp-btn.sm{height:24px;padding:0 8px;font-size:12px}',
       '.adp-pill{padding:1px 7px;border-radius:999px;font-size:11px;white-space:nowrap;',
       'border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary)}',
       '.adp-pill.on{color:var(--dsw-alias-state-success-primary);border-color:currentColor}',
@@ -275,8 +292,29 @@ window.__ModuleLoader__.load({
       '.adp-switch[aria-checked="true"] .adp-knob{transform:translateX(16px)}',
       '.adp-note{margin:0;padding:10px 12px;font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.adp-error{margin:0;padding:10px 12px;font-size:12px;color:var(--dsw-alias-state-error-primary)}',
-      '.adp-chat{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}',
-      '.adp-msgs{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}',
+      '.adp-pane{flex:1 1 auto}',
+      '.adp-chat{display:flex;flex-direction:column;min-height:0;flex:1 1 auto;position:relative}',
+      '.adp-msgs{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:16px 20px}',
+      // The transcript keeps a readable measure on wide screens, like the Host's.
+      '.adp-thread{max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:14px}',
+      '.adp-jump{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:1;',
+      'height:28px;padding:0 12px;border-radius:999px;font:inherit;font-size:12px;cursor:pointer;',
+      'color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);',
+      'border:1px solid var(--dsw-alias-border-l2);box-shadow:0 2px 8px rgba(0,0,0,.12)}',
+      '.adp-typing{display:inline-flex;align-items:center;gap:8px;color:var(--dsw-alias-label-tertiary);',
+      'font-size:var(--dsh-content-font-size-secondary,13px);line-height:22px}',
+      '.adp-typing i{display:inline-block;width:5px;height:5px;margin-right:3px;border-radius:50%;',
+      'background:currentColor;animation:adp-bounce 1.2s ease-in-out infinite}',
+      '.adp-typing i:nth-child(2){animation-delay:.15s}',
+      '.adp-typing i:nth-child(3){animation-delay:.3s}',
+      '@keyframes adp-bounce{0%,80%,100%{opacity:.3;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}',
+      // Streaming caret at the tail of the answer that is still being written.
+      '.adp-md.streaming>:is(p,h1,h2,h3,h4,h5,h6,blockquote):last-child::after,',
+      '.adp-md.streaming>:is(ul,ol):last-child>li:last-child::after,',
+      '.adp-md.streaming:empty::after{content:"";display:inline-block;width:2px;height:1.05em;',
+      'margin-left:2px;vertical-align:-.18em;background:var(--dsw-alias-brand-primary,currentColor);',
+      'animation:adp-blink 1s steps(1) infinite}',
+      '@keyframes adp-blink{50%{opacity:0}}',
       // Transcript layout mirrors the Host: user = right-aligned bubble, assistant =
       // full-width prose, system = centred notice.
       '.adp-msg{display:flex;max-width:100%;min-width:0;font-size:var(--dsh-content-font-size,13px)}',
@@ -325,15 +363,19 @@ window.__ModuleLoader__.load({
       // Process rows are deliberately quiet: the answer is the content, the steps are
       // supporting detail. The Host dims reasoning to label-tertiary and tool rows to
       // label-secondary for the same reason.
-      '.adp-row{display:flex;flex-direction:column;margin:2px 0}',
+      '.adp-turn{display:flex;flex-direction:column;gap:4px;min-width:0}',
+      '.adp-step{display:flex;flex-direction:column;margin:0}',
+      '.adp-turn>.adp-md{margin:6px 0}',
       '.adp-rowhead{display:flex;align-items:center;gap:6px;width:100%;min-width:0;padding:0;border:0;',
       'background:none;font:inherit;text-align:left;cursor:pointer;color:var(--dsw-alias-label-tertiary);',
       'font-size:var(--dsh-content-font-size-secondary,13px);line-height:22px}',
+      '.adp-rowhead:hover:not(:disabled){color:var(--dsw-alias-label-secondary)}',
       '.adp-rowhead:disabled{cursor:default}',
-      '.adp-row.tool .adp-rowhead{color:var(--dsw-alias-label-secondary)}',
-      '.adp-row.tool .adp-rowlabel{font-weight:500}',
+      '.adp-step.tool .adp-rowhead{color:var(--dsw-alias-label-secondary)}',
+      '.adp-step.tool .adp-rowlabel{font-weight:500}',
+      '.adp-step.running .adp-rowlabel{animation:adp-pulse 1.6s ease-in-out infinite}',
       '.adp-dot{flex:none;width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-label-caption)}',
-      '.adp-row.running .adp-dot{background:var(--dsw-alias-state-business-primary);',
+      '.adp-step.running .adp-dot{background:var(--dsw-alias-state-business-primary);',
       'animation:adp-pulse 1.2s ease-in-out infinite}',
       '@keyframes adp-pulse{0%,100%{opacity:1}50%{opacity:.35}}',
       '.adp-caret{flex:none;width:10px;color:var(--dsw-alias-label-caption)}',
@@ -344,8 +386,11 @@ window.__ModuleLoader__.load({
       'background:var(--dsw-alias-bg-layer-2);border:0.5px solid var(--dsw-alias-border-l1);',
       'max-height:280px;overflow:auto;display:flex;flex-direction:column;gap:6px}',
       '.adp-md-dim{color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px)}',
-      '.adp-row.notice{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
-      '.adp-card{margin-top:8px;padding:10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
+      '.adp-step.notice{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+      '.adp-step.task{font-size:var(--dsh-content-font-size-secondary,13px);line-height:22px;',
+      'color:var(--dsw-alias-label-secondary)}',
+      // Interaction cards (files, questionnaires) inside a turn; distinct from `.adp-card`.
+      '.adp-icard{margin-top:8px;padding:10px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);',
       'background:var(--dsw-alias-bg-layer-1)}',
       '.adp-cardtitle{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);margin-bottom:6px}',
       '.adp-question{margin-bottom:6px}',
@@ -362,21 +407,36 @@ window.__ModuleLoader__.load({
       '.adp-optionconfirm{align-self:flex-start;margin-top:6px}',
       '.adp-filelink{font-size:11px;color:var(--dsw-alias-state-business-primary);word-break:break-all}',
       '.adp-msg.sys{align-self:center;font-size:12px;color:var(--dsw-alias-state-error-primary);background:none}',
-      '.adp-compose{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l1);',
-      'flex:0 0 auto;align-items:flex-end}',
-      '.adp-textarea{flex:1 1 auto;min-height:34px;max-height:120px;resize:vertical;box-sizing:border-box;',
-      'padding:7px 10px;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary);',
-      'background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;outline:none}',
-      '.adp-textarea:focus{border-color:var(--dsw-alias-brand-primary)}',
-      '.adp-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 12px;',
+      // Composer: one rounded box holding an auto-growing textarea and the action button.
+      '.adp-compose{flex:0 0 auto;padding:10px 20px 12px}',
+      '.adp-composebox{max-width:820px;margin:0 auto;display:flex;align-items:flex-end;gap:8px;',
+      'padding:8px 8px 8px 12px;border-radius:12px;background:var(--dsw-alias-bg-base);',
+      'border:1px solid var(--dsw-alias-border-l1);transition:border-color .12s ease}',
+      '.adp-composebox:focus-within{border-color:var(--dsw-alias-brand-primary)}',
+      '.adp-textarea{flex:1 1 auto;min-height:22px;max-height:160px;resize:none;box-sizing:border-box;',
+      'padding:4px 0;font:inherit;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);',
+      'background:transparent;border:0;outline:none;overflow-y:auto}',
+      '.adp-composehint{max-width:820px;margin:4px auto 0;font-size:11px;color:var(--dsw-alias-label-caption)}',
+      '.adp-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 14px;',
       'border-top:1px solid var(--dsw-alias-border-l1);font-size:11px;',
-      'color:var(--dsw-alias-label-secondary);flex:0 0 auto}',
-      '.adp-events{max-height:120px;overflow:auto;margin:0;padding:8px 12px;font-size:11px;',
-      'color:var(--dsw-alias-label-secondary);border-top:1px solid var(--dsw-alias-border-l1)}',
-      '.adp-events div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      'color:var(--dsw-alias-label-secondary);flex:0 0 auto;position:relative}',
+      '.adp-footgroup{display:flex;align-items:center;gap:12px;min-width:0}',
+      // Raw ADP events are a debugging aid: folded into the footer, opening upward.
+      '.adp-events{position:relative}',
+      '.adp-events summary{cursor:pointer;list-style:none;user-select:none}',
+      '.adp-events summary::-webkit-details-marker{display:none}',
+      '.adp-events summary::before{content:"▸ "}',
+      '.adp-events[open] summary::before{content:"▾ "}',
+      '.adp-eventlist{position:absolute;right:0;bottom:calc(100% + 8px);width:min(420px,70vw);max-height:220px;',
+      'overflow:auto;padding:8px 10px;border-radius:8px;z-index:2;background:var(--dsw-alias-bg-layer-1);',
+      'border:1px solid var(--dsw-alias-border-l2);box-shadow:0 4px 16px rgba(0,0,0,.12)}',
+      '.adp-eventlist div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:18px}',
       '.adp-empty{padding:24px 12px;text-align:center;font-size:13px;color:var(--dsw-alias-label-secondary)}',
-      '.adp-skel{height:52px;margin:0;border-bottom:1px solid var(--dsw-alias-border-l1);',
-      'background:linear-gradient(90deg,transparent,var(--dsw-alias-bg-layer-2),transparent)}',
+      '.adp-skel{height:48px;margin:0 0 4px;border-radius:8px;',
+      'background:linear-gradient(90deg,transparent,var(--dsw-alias-bg-layer-2),transparent);',
+      'background-size:200% 100%;animation:adp-shimmer 1.4s linear infinite}',
+      '@keyframes adp-shimmer{from{background-position:200% 0}to{background-position:-200% 0}}',
+      '.adp-root>.adp-card{flex:0 0 auto}',
       '.adp-form{display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:8px 12px;padding:12px}',
       '.adp-form label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.adp-select.wide{width:100%}',
@@ -485,30 +545,35 @@ window.__ModuleLoader__.load({
         ? t(statusKey2)
         : (app.adpStatusDescription || app.adpStatusLabel?.zh || '—');
       const unpublished = app.adpStatus !== 2;
+      const initial = String(app.name || '?').trim().charAt(0).toUpperCase() || '?';
       return h('div', {
-        className: `adp-row${selected ? ' sel' : ''}`,
+        className: `adp-app${selected ? ' sel' : ''}`,
         onClick: () => onSelect(app.appId),
         role: 'button',
         tabIndex: 0,
+        'aria-pressed': selected ? 'true' : 'false',
         onKeyDown: (event) => {
-          if (event.key === 'Enter' || event.key === ' ') onSelect(app.appId);
+          if (event.target !== event.currentTarget) return;
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onSelect(app.appId);
+          }
         },
       },
         app.avatar
           ? h('img', { className: 'adp-avatar', src: app.avatar, alt: '', loading: 'lazy' })
-          : h('div', { className: 'adp-avatar', 'aria-hidden': true }),
+          : h('div', { className: 'adp-avatar', 'aria-hidden': true }, initial),
         h('div', { className: 'adp-main' },
-          h('div', { className: 'adp-name', title: app.name }, app.name || '(未命名)'),
-          h('div', { className: 'adp-meta' },
-            `${app.appId}${app.appModeLabel ? ` · ${app.appModeLabel.zh}` : ''}`),
+          h('div', { className: 'adp-nameline' },
+            h('span', { className: 'adp-name', title: app.name }, app.name || '(未命名)'),
+            h('span', { className: `adp-pill ${statusKey}` }, statusText)),
+          h('div', { className: 'adp-meta', title: app.appId },
+            `${app.appModeLabel ? `${app.appModeLabel.zh} · ` : ''}${app.appId}`),
         ),
         h('div', { className: 'adp-tags' },
-          // The switch states the gate itself, so the row keeps only the ADP status and
-          // leaves the name room to read in a narrow column.
-          h('span', { className: `adp-pill ${statusKey}` }, statusText),
           unpublished
             ? h('button', {
-              className: 'adp-btn',
+              className: 'adp-btn sm',
               type: 'button',
               disabled: busy,
               title: t('publishHint'),
@@ -707,9 +772,12 @@ window.__ModuleLoader__.load({
 
     /** Assistant prose, rendered the way the Host renders its own. */
     function Markdown(props) {
-      const { text, className } = props;
+      const { text, className, streaming } = props;
       const nodes = React.useMemo(() => blockNodes(text, 'md'), [text]);
-      return h('div', { className: className === undefined ? 'adp-md' : `adp-md ${className}` }, nodes);
+      const classes = ['adp-md'];
+      if (className !== undefined) classes.push(className);
+      if (streaming) classes.push('streaming');
+      return h('div', { className: classes.join(' ') }, nodes);
     }
 
     /**
@@ -750,19 +818,32 @@ window.__ModuleLoader__.load({
       const { entry } = props;
       const [open, setOpen] = useState(false);
       const running = entry.status === 'running';
-      return h('div', { className: `adp-row${running ? ' running' : ''}` },
+      const text = entry.text || '';
+      // While thinking, the collapsed row previews the latest line so progress is visible
+      // without expanding the whole trace.
+      const preview = running && !open
+        ? text.replace(/\s+/g, ' ').trim().slice(-80)
+        : '';
+      return h('div', { className: `adp-step${running ? ' running' : ''}` },
         h('button', {
           type: 'button',
           className: 'adp-rowhead',
           'aria-expanded': open ? 'true' : 'false',
+          disabled: text === '',
           onClick: () => setOpen(value => !value),
         },
         h('span', { className: 'adp-caret' }, open ? '▾' : '▸'),
         h('span', { className: 'adp-rowlabel' }, entry.title || entry.name || '思考'),
-        running ? h('span', { className: 'adp-sweep' }) : null),
+        preview !== '' ? h('span', { className: 'adp-rowsummary' }, preview) : null),
         open
-          ? h('div', { className: 'adp-rowbody' }, h(Markdown, { text: entry.text, className: 'adp-md-dim' }))
+          ? h('div', { className: 'adp-rowbody' },
+            h(Markdown, { text, className: 'adp-md-dim', streaming: running }))
           : null);
+    }
+
+    /** Only http(s) links from the platform become anchors. */
+    function safeHref(url) {
+      return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : undefined;
     }
 
     /** One tool invocation: name plus the concrete call, expandable to its output. */
@@ -775,7 +856,7 @@ window.__ModuleLoader__.load({
       const name = entry.tool || entry.name || '工具';
       const detail = toolSummary(entry.title);
       const hasBody = entry.text !== '' || (entry.files || []).length > 0;
-      return h('div', { className: `adp-row tool${running ? ' running' : ''}` },
+      return h('div', { className: `adp-step tool${running ? ' running' : ''}` },
         h('button', {
           type: 'button',
           className: 'adp-rowhead',
@@ -795,7 +876,7 @@ window.__ModuleLoader__.load({
             (entry.files || []).map((file, position) => h('a', {
               key: position,
               className: 'adp-filelink',
-              href: file.url,
+              href: safeHref(file.url),
               target: '_blank',
               rel: 'noreferrer',
             }, file.name || file.url)))
@@ -804,23 +885,32 @@ window.__ModuleLoader__.load({
 
     /** Render one turn as the protocol ordered it. */
     function TurnTimeline(props) {
-      const { entries, busy } = props;
-      return entries.map((entry) => {
+      const { entries, streaming } = props;
+      const lastIndex = entries.length - 1;
+      return entries.map((entry, index) => {
         if (entry.kind === 'reasoning') return h(ReasoningRow, { key: entry.id, entry });
         if (entry.kind === 'tool') return h(ToolRow, { key: entry.id, entry });
         if (entry.kind === 'task') {
-          return h('div', { key: entry.id, className: 'adp-row task' },
-            h('span', { className: 'adp-rowlabel' }, toolSummary(entry.title) || entry.name || entry.text || '任务'));
+          return h('div', { key: entry.id, className: 'adp-step task' },
+            toolSummary(entry.title) || entry.name || entry.text || '任务');
         }
         if (entry.kind === 'answer') {
+          // The caret rides on the answer only while it is the live tail of the turn.
           return entry.text === ''
             ? null
-            : h(Markdown, { key: entry.id, text: entry.text });
+            : h(Markdown, { key: entry.id, text: entry.text, streaming: streaming && index === lastIndex });
         }
         return entry.text === ''
           ? null
-          : h('div', { key: entry.id, className: 'adp-row notice' }, entry.text);
+          : h('div', { key: entry.id, className: 'adp-step notice' }, entry.text);
       });
+    }
+
+    /** Animated placeholder shown before the first token of a turn arrives. */
+    function Typing(props) {
+      return h('div', { className: 'adp-typing', role: 'status' },
+        h('span', { 'aria-hidden': true }, h('i'), h('i'), h('i')),
+        props.label);
     }
 
     /**
@@ -831,7 +921,10 @@ window.__ModuleLoader__.load({
      * without this the question is invisible. Choosing an option sends its label as the
      * next message, which is how the platform expects the answer.
      */
-    function renderInteraction(interaction, key, { busy, onChoose }) {
+    function Interaction(props) {
+      const { interaction, busy, onChoose } = props;
+      // A component (not a helper) so this hook keeps a stable slot per card.
+      const [picked, setPicked] = useState({});
       if (!interaction || typeof interaction !== 'object') return null;
 
       if (interaction.kind === 'file') {
@@ -840,14 +933,13 @@ window.__ModuleLoader__.load({
         if (interaction.url) {
           parts.push(h('a', {
             key: 'link', className: 'adp-filelink',
-            href: interaction.url, target: '_blank', rel: 'noreferrer',
+            href: safeHref(interaction.url), target: '_blank', rel: 'noreferrer',
           }, interaction.url));
         }
-        return h('div', { className: 'adp-card', key }, parts);
+        return h('div', { className: 'adp-icard' }, parts);
       }
 
       if (interaction.kind !== 'questionnaire') return null;
-      const [picked, setPicked] = useState({});
       const questions = Array.isArray(interaction.questions) ? interaction.questions : [];
 
       const questionNodes = questions.map((question) => {
@@ -888,7 +980,7 @@ window.__ModuleLoader__.load({
         parts.push(h('div', { key: 'title', className: 'adp-cardtitle' }, interaction.title));
       }
       parts.push(...questionNodes);
-      return h('div', { className: 'adp-card', key }, parts);
+      return h('div', { className: 'adp-icard' }, parts);
     }
 
     /**
@@ -945,20 +1037,49 @@ window.__ModuleLoader__.load({
           ...state,
           messages: typeof update === 'function' ? update(state.messages) : update,
         })), [store]);
-      const setEvents = useCallback(
-        update => store.patch(state => ({
-          ...state,
-          events: typeof update === 'function' ? update(state.events) : update,
-        })), [store]);
       const setDraft = useCallback(value => store.patch({ draft: value }), [store]);
-      const setBusy = useCallback(value => store.patch({ busy: value }), [store]);
       const setConversationId = useCallback(value => store.patch({ conversationId: value }), [store]);
       const setTransport = useCallback(value => store.patch({ transport: value }), [store]);
       const scrollRef = useRef(null);
+      const inputRef = useRef(null);
+      // Follow the stream only while the reader is at the bottom; scrolling up to read
+      // earlier output pins the view until they jump back.
+      const stickRef = useRef(true);
+      const [detached, setDetached] = useState(false);
 
-      useEffect(() => {
-        if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }, [messages]);
+      const onScroll = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        stickRef.current = atBottom;
+        setDetached(previous => (previous === !atBottom ? previous : !atBottom));
+      }, []);
+
+      const jumpToLatest = useCallback(() => {
+        const el = scrollRef.current;
+        stickRef.current = true;
+        setDetached(false);
+        if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+      }, []);
+
+      // A different app is a different transcript: start at its latest message.
+      useLayoutEffect(() => {
+        stickRef.current = true;
+        setDetached(false);
+      }, [store]);
+
+      useLayoutEffect(() => {
+        const el = scrollRef.current;
+        if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+      }, [messages, store]);
+
+      // Grow the composer with its content up to the CSS max-height.
+      useLayoutEffect(() => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+      }, [draft, store]);
 
       // Only the explicit "new conversation" button resets; a remount must not, because
       // the store already holds the live conversation for this app.
@@ -974,11 +1095,54 @@ window.__ModuleLoader__.load({
       const send = useCallback(async (override) => {
         const text = typeof override === 'string' ? override.trim() : draft.trim();
         if (text === '' || busy || !app) return;
-        setDraft('');
-        setBusy(true);
-        setMessages(previous => [...previous, { role: 'user', text }, { role: 'agent', text: '' }]);
+
+        // The turn is assembled in a local draft and published to the store at most once
+        // per animation frame: a fast stream delivers dozens of SSE frames per paint, and
+        // re-rendering (and re-parsing markdown) for each one made the output stutter.
+        const turnId = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const turn = { id: turnId, role: 'agent', text: '', entries: [], streaming: true };
+        let pendingEvents = [];
+        let frameHandle = 0;
+        const cancelFrame = () => {
+          if (frameHandle !== 0) cancelAnimationFrame(frameHandle);
+          frameHandle = 0;
+        };
+        const flush = () => {
+          frameHandle = 0;
+          const snapshot = { ...turn, entries: turn.entries.slice() };
+          const fresh = pendingEvents;
+          pendingEvents = [];
+          store.patch((state) => {
+            const at = state.messages.findIndex(message => message.id === turnId);
+            // "New conversation" cleared the transcript meanwhile: drop the late output.
+            if (at < 0) return state;
+            const nextMessages = state.messages.slice();
+            nextMessages[at] = snapshot;
+            return {
+              ...state,
+              messages: nextMessages,
+              events: fresh.length > 0 ? [...state.events, ...fresh].slice(-40) : state.events,
+            };
+          });
+        };
+        const schedule = () => {
+          if (frameHandle === 0) frameHandle = requestAnimationFrame(flush);
+        };
+        const flushNow = () => {
+          cancelFrame();
+          flush();
+        };
+
         const controller = new AbortController();
-        store.patch({ controller });
+        stickRef.current = true;
+        setDetached(false);
+        store.patch(state => ({
+          ...state,
+          draft: '',
+          busy: true,
+          controller,
+          messages: [...state.messages, { id: `${turnId}u`, role: 'user', text }, { ...turn }],
+        }));
         try {
           const response = await fetch(`${ROUTE}/chat`, {
             method: 'POST',
@@ -1012,37 +1176,30 @@ window.__ModuleLoader__.load({
                 // into the running turn's timeline.
                 const patch = frame.data;
                 if (patch && typeof patch.id === 'string') {
-                  setMessages(previous => {
-                    const next = previous.slice();
-                    const last = next[next.length - 1];
-                    const entries = (last.entries || []).slice();
-                    const at = entries.findIndex(item => item.id === patch.id);
-                    const base = at >= 0 ? entries[at] : {
-                      id: patch.id, kind: 'notice', name: '', title: '', tool: '',
-                      status: 'running', text: '', files: [],
-                    };
-                    const merged = { ...base };
-                    for (const key of ['kind', 'name', 'title', 'tool', 'status', 'files']) {
-                      if (patch[key] !== undefined) merged[key] = patch[key];
-                    }
-                    if (typeof patch.text === 'string') merged.text = patch.text;
-                    else if (typeof patch.append === 'string') merged.text = (merged.text || '') + patch.append;
-                    if (at >= 0) entries[at] = merged; else entries.push(merged);
-                    next[next.length - 1] = { ...last, entries };
-                    return next;
-                  });
+                  const at = turn.entries.findIndex(item => item.id === patch.id);
+                  const base = at >= 0 ? turn.entries[at] : {
+                    id: patch.id, kind: 'notice', name: '', title: '', tool: '',
+                    status: 'running', text: '', files: [],
+                  };
+                  // Each changed entry is a new object so rendered snapshots stay immutable.
+                  const merged = { ...base };
+                  for (const key of ['kind', 'name', 'title', 'tool', 'status', 'files']) {
+                    if (patch[key] !== undefined) merged[key] = patch[key];
+                  }
+                  if (typeof patch.text === 'string') merged.text = patch.text;
+                  else if (typeof patch.append === 'string') merged.text = (merged.text || '') + patch.append;
+                  if (at >= 0) turn.entries[at] = merged; else turn.entries.push(merged);
+                  schedule();
                 }
                 continue;
               }
               if (frame.name === 'console.delta') {
-                const delta = frame.data && frame.data.text ? frame.data.text : '';
+                // The flat answer text rides alongside the timeline; it must extend the
+                // turn, not replace it (replacing it dropped the streamed timeline).
+                const delta = frame.data && typeof frame.data.text === 'string' ? frame.data.text : '';
                 if (delta !== '') {
-                  setMessages(previous => {
-                    const next = previous.slice();
-                    const last = next[next.length - 1];
-                    next[next.length - 1] = { role: 'agent', text: last.text + delta };
-                    return next;
-                  });
+                  turn.text += delta;
+                  schedule();
                 }
                 continue;
               }
@@ -1058,49 +1215,49 @@ window.__ModuleLoader__.load({
                 const timeline = frame.data && Array.isArray(frame.data.timeline) && frame.data.timeline.length > 0
                   ? frame.data.timeline
                   : null;
-                setMessages(previous => {
-                  const next = previous.slice();
-                  const last = next[next.length - 1];
-                  next[next.length - 1] = {
-                    role: 'agent',
-                    text: final !== '' ? final : last.text,
-                    entries: timeline ?? last.entries,
-                    interactions: interactions.length > 0 ? interactions : undefined,
-                  };
-                  return next;
-                });
+                if (final !== '') turn.text = final;
+                if (timeline !== null) turn.entries = timeline.slice();
+                if (interactions.length > 0) turn.interactions = interactions;
+                turn.streaming = false;
+                flushNow();
                 continue;
               }
               if (frame.name === 'console.error') {
                 const message = frame.data && frame.data.error ? frame.data.error : t('error');
-                setMessages(previous => [...previous, { role: 'sys', text: message }]);
+                // A stalled turn may still carry a usable partial answer.
+                const partial = frame.data && typeof frame.data.partialText === 'string' ? frame.data.partialText : '';
+                if (partial !== '' && turn.text === '' && turn.entries.length === 0) turn.text = partial;
+                flushNow();
+                setMessages(previous => [...previous, { id: `${turnId}e`, role: 'sys', text: message }]);
                 continue;
               }
               if (frame.name === 'adp.event') {
-                const name = frame.data && frame.data.name ? frame.data.name : '?';
-                // Tool calls carry what the agent is actually doing; without it a long
-                // turn shows a wall of identical event names.
-                const message = frame.data && frame.data.payload && frame.data.payload.Message;
-                const tool = message && message.Type === 'tool_call'
-                  ? (message.Title || (message.ExtraInfo && message.ExtraInfo.ToolName) || '')
-                  : '';
-                const detail = tool !== '' ? `${name} · ${String(tool).slice(0, 80)}` : name;
-                setEvents(previous => [...previous.slice(-40), detail]);
+                const name = frame.data && frame.data.name ? String(frame.data.name) : '?';
+                const label = frame.data && typeof frame.data.label === 'string' ? frame.data.label : '';
+                const detail = label !== '' && label !== name ? `${name} · ${label.slice(0, 80)}` : name;
+                pendingEvents.push(detail);
+                schedule();
               }
             }
           }
         } catch (error) {
           if (error && error.name !== 'AbortError') {
-            setMessages(previous => [...previous, { role: 'sys', text: String(error.message || error) }]);
+            flushNow();
+            setMessages(previous => [...previous, { id: `${turnId}x`, role: 'sys', text: String(error.message || error) }]);
           }
         } finally {
-          store.patch({ controller: null });
-          setBusy(false);
+          cancelFrame();
+          // A stopped or broken turn must not leave steps pulsing as if still running.
+          turn.streaming = false;
+          turn.entries = turn.entries.map(entry => (entry.status === 'running' ? { ...entry, status: 'done' } : entry));
+          flush();
+          // Only release the pane if a newer turn has not taken it over since.
+          if (store.get().controller === controller) store.patch({ controller: null, busy: false });
         }
-      }, [app, busy, conversationId, draft, t, userId]);
+      }, [app, busy, conversationId, draft, store, t, userId]);
 
       if (!app) {
-        return h('section', { className: 'adp-card' },
+        return h('section', { className: 'adp-card adp-pane' },
           h('div', { className: 'adp-cardhead' }, t('chat')),
           h('div', { className: 'adp-empty' }, t('chatPick')),
         );
@@ -1108,91 +1265,127 @@ window.__ModuleLoader__.load({
 
       const blocked = !app.dshEnabled;
       const appStatusKey = ADP_STATUS_KEY[app.adpStatus];
-      return h('section', { className: 'adp-card' },
+
+      /** The assistant side of one turn: timeline, live answer, or a typing hint. */
+      const renderAgent = (message, isLast) => {
+        // Turns stored before `streaming` existed fall back to the pane-level flag.
+        const streaming = message.streaming === true || (message.streaming === undefined && busy && isLast);
+        const entries = message.entries || [];
+        const visible = entries.filter(entry => entry.text !== ''
+          || entry.kind === 'reasoning' || entry.kind === 'tool' || entry.kind === 'task');
+        if (visible.length === 0 && message.text === '') {
+          return streaming ? h(Typing, { label: t('thinking') }) : null;
+        }
+        if (entries.length === 0) return h(Markdown, { text: message.text, streaming });
+        // Between steps (a tool finished, the next has not started) keep a quiet hint so
+        // the turn does not look finished while the agent is still working.
+        const tail = visible[visible.length - 1];
+        const idle = streaming && tail !== undefined && tail.kind !== 'answer'
+          && !entries.some(entry => entry.status === 'running');
+        return h('div', { className: 'adp-turn' },
+          h(TurnTimeline, { entries, streaming }),
+          idle ? h(Typing, { label: t('thinking') }) : null);
+      };
+
+      return h('section', { className: 'adp-card adp-pane' },
         h('div', { className: 'adp-cardhead' },
-          h('div', { className: 'adp-headmain' },
-            h('span', { className: 'adp-headname', title: app.name }, app.name || t('chat')),
-            h('span', { className: `adp-pill ${app.adpStatus === 2 ? 'on' : 'off'}` },
-              appStatusKey === undefined ? '—' : t(appStatusKey)),
-            app.dshEnabled
-              ? h('span', { className: 'adp-pill on' }, t('gateOn'))
-              : h('span', { className: 'adp-pill off' }, t('gateOff')),
+          h('div', { className: 'adp-headtext' },
+            h('div', { className: 'adp-headmain' },
+              h('span', { className: 'adp-headname', title: app.name }, app.name || t('chat')),
+              h('span', { className: `adp-pill ${app.adpStatus === 2 ? 'on' : 'off'}` },
+                appStatusKey === undefined ? '—' : t(appStatusKey)),
+              app.dshEnabled
+                ? h('span', { className: 'adp-pill on' }, t('gateOn'))
+                : h('span', { className: 'adp-pill off' }, t('gateOff')),
+            ),
+            h('div', { className: 'adp-headmeta' },
+              app.appModeLabel ? h('span', null, app.appModeLabel.zh) : null,
+              h('span', { title: conversationId || undefined }, `${t('conversation')}: ${conversationId || '—'}`),
+            ),
           ),
           h('button', {
-            className: 'adp-btn',
+            className: 'adp-btn sm',
             type: 'button',
             onClick: reset,
-            disabled: busy && messages.length === 0,
+            disabled: messages.length === 0 && !busy,
           }, t('newConversation')),
-        ),
-        h('div', { className: 'adp-headmeta' },
-          app.appModeLabel ? h('span', null, app.appModeLabel.zh) : null,
-          h('span', null, `${t('conversation')}: ${conversationId || '—'}`),
         ),
         blocked
           ? h('p', { className: 'adp-note' }, t('chatBlocked'))
           : h('div', { className: 'adp-chat' },
-            h('div', { className: 'adp-msgs', ref: scrollRef },
-              messages.length === 0
-                ? h('div', { className: 'adp-empty' }, t('chatPick'))
-                : messages.map((message, index) => {
-                  const role = message.role === 'user' ? 'user' : message.role === 'sys' ? 'sys' : 'agent';
-                  const pending = message.text === '' && busy && index === messages.length - 1;
-                  const interactions = (message.interactions || []).map((interaction, position) =>
-                    renderInteraction(interaction, position, { busy, onChoose: label => void send(label) }));
-                  // Mirror the Host's transcript: the user turn is a right-aligned bubble
-                  // while the assistant turn is full-width prose, not a second bubble.
-                  return h('div', { key: index, className: `adp-msg ${role}` },
-                    h('div', { className: 'adp-bubble' },
-                      (() => {
-                        if (role !== 'agent') return h('div', { className: 'adp-msgtext' }, message.text);
-                        if (pending) return h('div', { className: 'adp-md' }, '…');
-                        const entries = message.entries || [];
-                        // The timeline is the protocol order (思考 → 回复 → 工具 → …); the
-                        // flat text is only a fallback for turns that carried no messages.
-                        return entries.length > 0
-                          ? h(TurnTimeline, { entries, busy })
-                          : h(Markdown, { text: message.text });
-                      })(),
-                      interactions));
-                }),
+            h('div', { className: 'adp-msgs', ref: scrollRef, onScroll },
+              h('div', { className: 'adp-thread', 'aria-live': 'polite', 'aria-busy': busy ? 'true' : 'false' },
+                messages.length === 0
+                  ? h('div', { className: 'adp-empty' }, t('chatPlaceholder'))
+                  : messages.map((message, index) => {
+                    const role = message.role === 'user' ? 'user' : message.role === 'sys' ? 'sys' : 'agent';
+                    const interactions = (message.interactions || []).map((interaction, position) =>
+                      h(Interaction, {
+                        key: position,
+                        interaction,
+                        busy,
+                        onChoose: label => void send(label),
+                      }));
+                    // Mirror the Host's transcript: the user turn is a right-aligned bubble
+                    // while the assistant turn is full-width prose, not a second bubble.
+                    return h('div', { key: message.id || index, className: `adp-msg ${role}` },
+                      h('div', { className: 'adp-bubble' },
+                        role === 'agent'
+                          ? renderAgent(message, index === messages.length - 1)
+                          : h('div', { className: 'adp-msgtext' }, message.text),
+                        interactions));
+                  }),
+              ),
             ),
+            detached && messages.length > 0
+              ? h('button', { className: 'adp-jump', type: 'button', onClick: jumpToLatest }, `↓ ${t('jumpLatest')}`)
+              : null,
             h('div', { className: 'adp-compose' },
-              h('textarea', {
-                className: 'adp-textarea',
-                value: draft,
-                placeholder: t('chatPlaceholder'),
-                onChange: event => setDraft(event.target.value),
-                onKeyDown: (event) => {
-                  if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    void send();
-                  }
-                },
-              }),
-              busy
-                ? h('button', {
-                  className: 'adp-btn',
-                  type: 'button',
-                  onClick: () => store.get().controller?.abort(),
-                }, t('stop'))
-                : h('button', {
-                  className: 'adp-btn primary',
-                  type: 'button',
-                  disabled: draft.trim() === '',
-                  onClick: () => void send(),
-                }, t('send')),
+              h('div', { className: 'adp-composebox' },
+                h('textarea', {
+                  ref: inputRef,
+                  className: 'adp-textarea',
+                  rows: 1,
+                  value: draft,
+                  placeholder: t('chatPlaceholder'),
+                  onChange: event => setDraft(event.target.value),
+                  onKeyDown: (event) => {
+                    // Enter confirms an IME candidate while composing; it must not send.
+                    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      void send();
+                    }
+                  },
+                }),
+                busy
+                  ? h('button', {
+                    className: 'adp-btn',
+                    type: 'button',
+                    onClick: () => store.get().controller?.abort(),
+                  }, t('stop'))
+                  : h('button', {
+                    className: 'adp-btn primary',
+                    type: 'button',
+                    disabled: draft.trim() === '',
+                    onClick: () => void send(),
+                  }, t('send')),
+              ),
+              h('div', { className: 'adp-composehint' }, t('composeHint')),
             ),
           ),
-        events.length > 0
-          ? h('div', { className: 'adp-events' },
-            h('div', null, `${t('events')}: ${events.length}`),
-            events.slice(-6).map((name, index) => h('div', { key: index }, `· ${name}`)),
-          )
-          : null,
         h('div', { className: 'adp-foot' },
-          h('span', null, transport === '' ? t('dshCallableCopy') : t('transportLabel', { mode: transport.toUpperCase() })),
-          h('span', null, blocked ? t('dshBlocked') : t('dshCallable')),
+          h('div', { className: 'adp-footgroup' },
+            h('span', null, transport === '' ? t('dshCallableCopy') : t('transportLabel', { mode: transport.toUpperCase() })),
+            h('span', null, blocked ? t('dshBlocked') : t('dshCallable')),
+          ),
+          events.length > 0
+            ? h('details', { className: 'adp-events' },
+              h('summary', null, `${t('events')} · ${events.length}`),
+              h('div', { className: 'adp-eventlist' },
+                events.slice().reverse().map((name, index) => h('div', { key: index, title: name }, name))),
+            )
+            : null,
         ),
       );
     }
@@ -1756,7 +1949,9 @@ window.__ModuleLoader__.load({
 
             h('div', { className: 'adp-body' },
               h('section', { className: 'adp-card' },
-                h('div', { className: 'adp-cardhead' }, h('span', null, t('title'))),
+                h('div', { className: 'adp-cardhead' },
+                  h('span', null, t('appList')),
+                  h('span', { className: 'adp-count' }, String(visible.length))),
                 h('div', { className: 'adp-list' },
                   loading && visible.length === 0
                     ? [0, 1, 2].map(index => h('div', { key: index, className: 'adp-skel' }))

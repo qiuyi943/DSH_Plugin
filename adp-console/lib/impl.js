@@ -17,9 +17,12 @@
  */
 
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { lookup as dnsLookup } from 'node:dns'
+import { chmod, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { request as httpsRequest } from 'node:https'
+import { isIP } from 'node:net'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 
 export const name = 'adp-console'
 
@@ -97,6 +100,31 @@ export const DEFAULT_CONFIG = {
   mentionPickTtlMs: 1800000,
   /** How long the enabled-app name index used to resolve a hand-typed mention is reused. */
   mentionIndexMs: 60000,
+  /**
+   * Stream an ADP `thought` / `tool_call` message into the DSH turn as a folded
+   * `reasoning` block (the 思考过程 disclosure) instead of dropping it.
+   */
+  mentionReasoning: true,
+  /**
+   * Copy each ADP-produced file into the Session workspace so the transcript links a
+   * local path the DSH document preview opens, instead of a signed COS URL that only
+   * the external browser can fetch. `false` keeps the remote download link.
+   */
+  fileDownload: true,
+  /** Workspace-relative directory the copied files land in. Must stay inside the workspace. */
+  fileDownloadDir: 'adp-output',
+  /**
+   * HTTPS host suffixes an ADP file URL may be fetched from. Every resolved address is
+   * also checked against private, loopback and reserved ranges, so this list cannot be
+   * used to reach an internal service.
+   */
+  fileDownloadHosts: ['adp-cos.com', 'myqcloud.com'],
+  /** Per-file byte cap; a larger file keeps its remote link. */
+  fileDownloadMaxBytes: 52428800,
+  /** Per-file download deadline. */
+  fileDownloadTimeoutMs: 60000,
+  /** Maximum number of files copied for one turn; the rest keep their remote links. */
+  fileDownloadMaxFiles: 10,
   /**
    * Prefer the official `tencentcloud-sdk-nodejs-adp` for management calls.
    * When it is not installed the plugin falls back to its built-in TC3 signer.
@@ -913,13 +941,67 @@ function extractInteractions(record) {
           out.push({ kind: 'questionnaire', title: form.Title ?? '', questions })
         }
       } else if (content.Type === 'file') {
-        out.push({
-          kind: 'file',
-          name: content.FileName ?? content.Name ?? '',
-          url: content.FileUrl ?? content.Url ?? '',
-        })
+        out.push({ kind: 'file', ...fileInfoOf(content) })
       }
+      const references = referencesOf(content)
+      if (references.length > 0) out.push({ kind: 'references', references })
     }
+  }
+  return out
+}
+
+/**
+ * Normalise one ADP `file` content into the fields DSH renders.
+ *
+ * The protocol nests the metadata: `Content.File` is a `FileInfo`
+ * `{ FileName, FileUrl, FileSize, FileType, Url?, DocId? }`. Reading the flat
+ * `Content.FileName` / `Content.FileUrl` (as earlier captures suggested) yields empty
+ * strings for every real file, which is what left the turn with a nameless, unlinked
+ * 「产出文件」. The flat spellings stay as a fallback for older frames.
+ * @param content - an ADP `Content` whose `Type` is `file`.
+ * @returns `{ name, url, size, type }`; `size` is a byte count or null.
+ */
+export function fileInfoOf(content) {
+  const info = content?.File !== null && typeof content?.File === 'object' ? content.File : {}
+  const text = value => (typeof value === 'string' ? value : '')
+  const url = text(info.FileUrl) || text(info.Url) || text(content?.FileUrl) || text(content?.Url)
+  let name = text(info.FileName) || text(content?.FileName) || text(content?.Name)
+  if (name === '' && url !== '') {
+    try {
+      name = decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '')
+    } catch {
+      name = ''
+    }
+  }
+  const rawSize = info.FileSize ?? content?.FileSize
+  const size = Number.isSafeInteger(Number(rawSize)) && Number(rawSize) >= 0 && rawSize !== '' ? Number(rawSize) : null
+  const type = text(info.FileType) || text(content?.FileType)
+  return { name, url, size, type }
+}
+
+/**
+ * Citation sources of one ADP `Content`, as `{ title, url }` with an http(s) URL.
+ *
+ * `References[]` carries knowledge-base documents (`DocRefer`), QA pairs and web search
+ * hits; only entries with a navigable URL become links, the rest keep their title.
+ * @param content - any ADP `Content`.
+ * @returns de-duplicated references in protocol order.
+ */
+export function referencesOf(content) {
+  const list = Array.isArray(content?.References) ? content.References : []
+  const out = []
+  const seen = new Set()
+  for (const reference of list) {
+    if (reference === null || typeof reference !== 'object') continue
+    const url = [reference.Url, reference.DocRefer?.Url, reference.WebSearchRefer?.Url]
+      .find(value => typeof value === 'string' && /^https?:\/\//iu.test(value)) ?? ''
+    const title = [reference.Name, reference.DocName, reference.DocRefer?.DocName, reference.QaRefer?.KnowledgeName]
+      .find(value => typeof value === 'string' && value.trim() !== '') ?? ''
+    if (title === '' && url === '') continue
+    const key = url || title
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ title: title.trim(), url })
   }
   return out
 }
@@ -1179,9 +1261,7 @@ function rebuildTimeline(record) {
       // On a tool message the `json_text` content is the tool's own output; on a reply it
       // is internal chatter and must not reach the prose.
       if (kind === 'tool' && content.Type === 'json_text' && typeof content.Text === 'string') text += content.Text
-      if (content.Type === 'file') {
-        files.push({ name: content.FileName ?? content.Name ?? '', url: content.FileUrl ?? content.Url ?? '' })
-      }
+      if (content.Type === 'file') files.push(fileInfoOf(content))
     }
     if (kind === 'reasoning') text = text.slice(0, REASONING_LIMIT)
     if (text === '' && files.length === 0 && kind === 'notice') continue
@@ -1747,10 +1827,12 @@ export function messageTextOf(message) {
  */
 export function renderInteractions(interactions) {
   const list = Array.isArray(interactions) ? interactions : []
-  const lines = []
+  const sections = []
+  const files = []
+  const references = []
   for (const item of list) {
     if (item?.kind === 'questionnaire') {
-      lines.push(`**${item.title || '需要你确认'}**`)
+      const lines = [`**${item.title || '需要你确认'}**`]
       for (const question of Array.isArray(item.questions) ? item.questions : []) {
         const marks = [question.required === true ? '必填' : '', question.multiSelect === true ? '可多选' : '']
           .filter(Boolean)
@@ -1760,11 +1842,369 @@ export function renderInteractions(interactions) {
         }
       }
       lines.push('直接回复你要选的选项名称即可继续。')
+      sections.push(lines.join('\n'))
     } else if (item?.kind === 'file') {
-      lines.push(`📄 ${item.name || '产出文件'}${item.url ? ` — ${item.url}` : ''}`)
+      files.push(item)
+    } else if (item?.kind === 'references') {
+      references.push(...(Array.isArray(item.references) ? item.references : []))
     }
   }
+  const fileSection = renderFiles(files)
+  if (fileSection !== '') sections.push(fileSection)
+  const referenceSection = renderReferences(references)
+  if (referenceSection !== '') sections.push(referenceSection)
+  return sections.join('\n\n')
+}
+
+/** Image extensions the DSH Markdown renderer can show inline from the workspace. */
+const INLINE_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'])
+
+/** Escape the characters that would end or nest a Markdown link label. */
+function markdownLabel(text) {
+  return String(text).replace(/[\\[\]*_`]/gu, '\\$&').replace(/\s+/gu, ' ').trim()
+}
+
+/**
+ * A workspace-relative path as a Markdown link target the DSH file-link parser accepts:
+ * each segment percent-encoded, so spaces and `?` / `#` inside a name stay literal.
+ * @param path - slash-separated path relative to the Session workspace.
+ * @returns the encoded link target.
+ */
+export function markdownPath(path) {
+  return String(path).split('/').map(segment => encodeURIComponent(segment)).join('/')
+}
+
+/** A remote URL as a Markdown link target; only `https:` / `http:` survive. */
+function markdownUrl(url) {
+  if (typeof url !== 'string' || !/^https?:\/\//iu.test(url)) return ''
+  return url.replace(/[()\s<>]/gu, char => encodeURIComponent(char))
+}
+
+/** Human-readable byte count. */
+function formatBytes(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return ''
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
+}
+
+/** Whether a file should render inline as an image. */
+function isInlineImage(file) {
+  const source = String(file?.localPath || file?.name || '')
+  const extension = source.includes('.') ? source.split('.').pop().toLowerCase() : ''
+  return INLINE_IMAGE_EXTENSIONS.has(extension) || /^image\//iu.test(String(file?.type ?? ''))
+}
+
+/**
+ * Render produced files as DSH-native Markdown.
+ *
+ * A file copied into the workspace (`localPath`) becomes a relative link, which DSH
+ * turns into a click-to-preview action in the sidebar (HTML, Office, PDF, code, images)
+ * once the message completes; an image is also shown inline. A file that could not be
+ * copied keeps its original download link and says why.
+ * @param files - `{ name, url, size, type, localPath?, error? }` descriptors.
+ * @returns a 「产出文件」 section, or '' when there are no files.
+ */
+export function renderFiles(files) {
+  const list = Array.isArray(files) ? files.filter(file => file !== null && typeof file === 'object') : []
+  if (list.length === 0) return ''
+  const lines = ['**产出文件**']
+  for (const file of list) {
+    const label = markdownLabel(file.name || (file.localPath ? file.localPath.split('/').pop() : '') || '产出文件')
+    const size = formatBytes(file.bytes ?? file.size)
+    const meta = [size, typeof file.type === 'string' && file.type !== '' && file.type.length <= 40 ? file.type : '']
+      .filter(Boolean).join(' · ')
+    const suffix = meta === '' ? '' : ` · ${meta}`
+    if (typeof file.localPath === 'string' && file.localPath !== '') {
+      const target = markdownPath(file.localPath)
+      if (isInlineImage(file)) lines.push('', `![${label}](${target})`, '')
+      const remote = markdownUrl(file.url)
+      lines.push(`- 📄 [${label}](${target})${suffix}${remote === '' ? '' : ` · [原始下载](${remote})`}`)
+      continue
+    }
+    const remote = markdownUrl(file.url)
+    if (remote === '') {
+      lines.push(`- 📄 ${label}${suffix}（ADP 没有返回可下载的地址）`)
+      continue
+    }
+    if (isInlineImage(file)) lines.push('', `![${label}](${remote})`, '')
+    const reason = typeof file.error === 'string' && file.error !== '' ? `（未保存到工作区：${file.error}）` : ''
+    lines.push(`- 📄 [${label}](${remote})${suffix}${reason}`)
+  }
   return lines.join('\n')
+}
+
+/**
+ * Render citation sources as a numbered list of links.
+ * @param references - `{ title, url }` descriptors from {@link referencesOf}.
+ * @returns a 「参考来源」 section, or '' when there are none.
+ */
+export function renderReferences(references) {
+  const seen = new Set()
+  const lines = []
+  for (const reference of Array.isArray(references) ? references : []) {
+    const url = markdownUrl(reference?.url)
+    const title = markdownLabel(reference?.title || reference?.url || '')
+    const key = url || title
+    if (key === '' || seen.has(key)) continue
+    seen.add(key)
+    lines.push(`${lines.length + 1}. ${url === '' ? title : `[${title || url}](${url})`}`)
+  }
+  return lines.length === 0 ? '' : ['**参考来源**', ...lines].join('\n')
+}
+
+/** The comparison key of a remote file URL: signatures and query strings rotate. */
+function fileUrlKey(url) {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.origin}${parsed.pathname}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Point the answer's own links at the workspace copies.
+ *
+ * A Claw reply usually cites its artifact inline — `[/workdir/output/x.html](https://…cos…)`.
+ * Once that file is copied, the same link should open the local preview rather than a
+ * signed URL, so every link whose origin + path matches a copied file is rewritten.
+ * @param text - Markdown answer text.
+ * @param files - descriptors with `url` and `localPath`.
+ * @returns the text with matching link targets replaced.
+ */
+export function rewriteFileLinks(text, files) {
+  if (typeof text !== 'string' || text === '') return text
+  const local = new Map()
+  for (const file of Array.isArray(files) ? files : []) {
+    if (typeof file?.localPath !== 'string' || file.localPath === '') continue
+    const key = fileUrlKey(file.url)
+    if (key !== '') local.set(key, markdownPath(file.localPath))
+  }
+  if (local.size === 0) return text
+  return text.replace(/\]\((https?:\/\/[^)\s]+)\)/gu, (match, url) => {
+    const target = local.get(fileUrlKey(url))
+    return target === undefined ? match : `](${target})`
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Workspace copies of ADP-produced files
+ * ------------------------------------------------------------------ */
+
+/** Parse a dotted IPv4 literal into four octets, or null. */
+function ipv4Octets(address) {
+  const parts = String(address).split('.')
+  if (parts.length !== 4) return null
+  const octets = parts.map(part => (/^\d{1,3}$/u.test(part) ? Number(part) : Number.NaN))
+  return octets.every(octet => Number.isInteger(octet) && octet >= 0 && octet <= 255) ? octets : null
+}
+
+/**
+ * Whether a resolved address is a public unicast address a download may connect to.
+ *
+ * Rejects loopback, private, carrier-grade NAT, link-local, multicast, documentation
+ * and reserved ranges (IPv4 and IPv6, including IPv4-mapped / NAT64 embeddings), plus
+ * the 9/8, 11/8, 21/8 and 30/8 blocks that are internal in this deployment.
+ * @param address - an IP literal.
+ * @returns true only for an address that is safe to reach.
+ */
+export function isPublicAddress(address) {
+  const family = isIP(String(address))
+  if (family === 4) {
+    const [a, b] = ipv4Octets(address)
+    if ([0, 9, 10, 11, 21, 30, 127].includes(a)) return false
+    if (a === 100 && b >= 64 && b <= 127) return false
+    if (a === 169 && b === 254) return false
+    if (a === 172 && b >= 16 && b <= 31) return false
+    if (a === 192 && (b === 168 || (b === 0))) return false
+    if (a === 198 && (b === 18 || b === 19 || b === 51)) return false
+    if (a === 203 && b === 0) return false
+    if (a >= 224) return false
+    return true
+  }
+  if (family === 6) {
+    const lower = String(address).toLowerCase()
+    const embedded = lower.match(/^(?:::ffff:|64:ff9b::)(\d{1,3}(?:\.\d{1,3}){3})$/u)
+    if (embedded) return isPublicAddress(embedded[1])
+    if (lower === '::' || lower === '::1') return false
+    if (/^::ffff:/u.test(lower) || /^64:ff9b:/u.test(lower)) return false
+    const head = Number.parseInt(lower.split(':')[0] || '0', 16)
+    if ((head & 0xfe00) === 0xfc00) return false
+    if ((head & 0xffc0) === 0xfe80) return false
+    if ((head & 0xff00) === 0xff00) return false
+    if (lower.startsWith('2001:db8:') || lower.startsWith('2001:0db8:')) return false
+    return true
+  }
+  return false
+}
+
+/**
+ * Whether a URL may be downloaded: HTTPS, default port, a DNS host name (no IP
+ * literal, no credentials) that equals or ends in one of the allowed suffixes.
+ * @param url - the candidate URL.
+ * @param suffixes - allowed host suffixes.
+ * @returns true when the URL passes every static check.
+ */
+export function isAllowedDownloadUrl(url, suffixes) {
+  let parsed
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== '') return false
+  if (parsed.port !== '' && parsed.port !== '443') return false
+  const host = parsed.hostname.toLowerCase().replace(/\.$/u, '')
+  if (host === '' || isIP(host.replace(/^\[|\]$/gu, '')) !== 0) return false
+  return (Array.isArray(suffixes) ? suffixes : []).some((suffix) => {
+    const normalised = String(suffix).toLowerCase().replace(/^\.+|\.+$/gu, '')
+    return normalised !== '' && (host === normalised || host.endsWith(`.${normalised}`))
+  })
+}
+
+/**
+ * DNS lookup that refuses non-public addresses, so the check applies to the address the
+ * socket actually connects to (no rebinding window between a pre-check and the connect).
+ */
+function publicOnlyLookup(hostname, options, callback) {
+  const opts = typeof options === 'function' ? {} : (options ?? {})
+  const done = typeof options === 'function' ? options : callback
+  dnsLookup(hostname, { ...opts, all: true }, (error, addresses) => {
+    if (error) {
+      done(error)
+      return
+    }
+    const list = Array.isArray(addresses) ? addresses : []
+    if (list.length === 0 || list.some(entry => !isPublicAddress(entry.address))) {
+      done(Object.assign(new Error(`拒绝连接非公网地址：${hostname}`), { code: 'EADDRNOTPUBLIC' }))
+      return
+    }
+    if (opts.all === true) done(null, list)
+    else done(null, list[0].address, list[0].family)
+  })
+}
+
+/**
+ * A file name that cannot leave its directory or confuse a shell or file manager.
+ * @param name - the name ADP reported.
+ * @returns a single path segment, at most 120 characters, never empty.
+ */
+export function safeFileName(name) {
+  let base = String(name ?? '').split(/[\\/]/u).pop() ?? ''
+  // eslint-disable-next-line no-control-regex
+  base = base.replace(/[\u0000-\u001f\u007f<>:"|?*]/gu, '_').replace(/^[.\s]+/u, '').replace(/[.\s]+$/u, '').trim()
+  if (base === '') base = 'file'
+  if (base.length > 120) {
+    const dot = base.lastIndexOf('.')
+    const extension = dot > 0 && base.length - dot <= 12 ? base.slice(dot) : ''
+    base = `${base.slice(0, 120 - extension.length)}${extension}`
+  }
+  return base
+}
+
+/**
+ * Resolve (and create) the download directory, proving it stays inside the workspace
+ * even when a component along the way is a symbolic link.
+ * @param cwd - the Session workspace (absolute).
+ * @param subdir - the configured workspace-relative directory.
+ * @returns `{ root, dir }` real paths.
+ */
+async function downloadDirectory(cwd, subdir) {
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw new Error('会话没有工作区目录')
+  const relativeDir = String(subdir ?? '').trim()
+  if (relativeDir === '' || isAbsolute(relativeDir) || relativeDir.split(/[\\/]/u).includes('..')) {
+    throw new Error(`fileDownloadDir 必须是工作区内的相对路径：${relativeDir}`)
+  }
+  const root = await realpath(cwd)
+  await mkdir(join(root, relativeDir), { recursive: true })
+  const dir = await realpath(join(root, relativeDir))
+  if (dir !== root && !dir.startsWith(`${root}${sep}`)) throw new Error('下载目录越出了工作区')
+  return { root, dir }
+}
+
+/** Open a new file exclusively, suffixing the stem until the name is free. */
+async function openFresh(dir, name) {
+  const dot = name.lastIndexOf('.')
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const extension = dot > 0 ? name.slice(dot) : ''
+  for (let attempt = 1; attempt <= 100; attempt += 1) {
+    const candidate = attempt === 1 ? name : `${stem}-${attempt}${extension}`
+    const path = join(dir, candidate)
+    try {
+      // `wx` fails on any existing entry, symbolic links included, so nothing is overwritten.
+      return { path, handle: await open(path, 'wx', 0o644) }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+  }
+  throw new Error(`同名文件过多：${name}`)
+}
+
+/**
+ * Copy one ADP-produced file into the Session workspace.
+ * @param options - `{ url, name, cwd, dir, hosts, maxBytes, timeoutMs, signal, lookup? }`.
+ * @returns `{ localPath, bytes }`, `localPath` relative to the workspace, slash-separated.
+ */
+export async function downloadAdpFile(options) {
+  const { url, cwd, hosts, maxBytes, timeoutMs, signal } = options
+  if (!isAllowedDownloadUrl(url, hosts)) throw new Error('下载地址不在允许的 HTTPS 域名内')
+  const { root, dir } = await downloadDirectory(cwd, options.dir)
+  const { path, handle } = await openFresh(dir, safeFileName(options.name || basename(new URL(url).pathname)))
+  let bytes = 0
+  let complete = false
+  try {
+    await new Promise((resolve, reject) => {
+      const request = httpsRequest(url, {
+        method: 'GET',
+        headers: { accept: '*/*' },
+        lookup: options.lookup ?? publicOnlyLookup,
+        signal,
+      })
+      const deadline = setTimeout(() => request.destroy(new Error('下载超时')), timeoutMs)
+      const settle = (error) => {
+        clearTimeout(deadline)
+        if (error) reject(error)
+        else resolve()
+      }
+      request.on('error', settle)
+      request.on('response', (response) => {
+        if (response.statusCode !== 200) {
+          response.resume()
+          settle(new Error(`下载失败：HTTP ${response.statusCode}`))
+          return
+        }
+        const declared = Number(response.headers['content-length'])
+        if (Number.isFinite(declared) && declared > maxBytes) {
+          response.destroy()
+          settle(new Error(`文件超过 ${formatBytes(maxBytes)} 上限`))
+          return
+        }
+        ;(async () => {
+          for await (const chunk of response) {
+            bytes += chunk.length
+            if (bytes > maxBytes) throw new Error(`文件超过 ${formatBytes(maxBytes)} 上限`)
+            await handle.write(chunk)
+          }
+        })().then(() => settle(), (error) => {
+          response.destroy()
+          settle(error)
+        })
+      })
+      request.end()
+    })
+    complete = true
+  } finally {
+    await handle.close()
+    if (!complete) await rm(path, { force: true })
+  }
+  return { localPath: relative(root, path).split(sep).join('/'), bytes }
 }
 
 /** A stable ADP `UserId` for one DSH session, so a conversation keeps one visitor. */
@@ -2178,10 +2618,14 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Bind the session from its newest user message, and strip the mention from that
-   * message: it addressed an app, not prose. A message with no mention keeps the
-   * binding, so one conversation with one app stays a conversation.
-   * @returns replacement messages when a mention had to be removed, else undefined.
+   * Bind the session from its newest user message. The mention stays in the
+   * message on purpose: the durable `user/message` event is what the transcript
+   * renders, so stripping it here would hide the reference the user typed. The
+   * routed ADP body is stripped separately in `route.body` below, and the bound
+   * turn is answered by `llm/stream` short-circuit, so the model never sees the
+   * token. A message with no mention keeps the binding, so one conversation
+   * with one app stays a conversation.
+   * @returns always undefined; the claimed messages are never rewritten.
    */
   async function claimMention(agent, messages, signal) {
     if (!Array.isArray(messages) || messages.length === 0) return undefined
@@ -2199,24 +2643,17 @@ export function apply(ctx, config) {
     const previous = mentionRoutes.get(sessionId)
     if (resolved !== undefined && resolved.appId === null) {
       mentionRoutes.delete(sessionId)
-    } else {
-      const bound = resolved ?? previous
-      if (bound !== undefined) {
-        mentionRoutes.set(sessionId, {
-          appId: bound.appId,
-          name: bound.name,
-          body: resolved === undefined ? claim.text : removeMentionToken(claim.text, resolved.name),
-        })
-      }
+      return undefined
     }
-    if (resolved === undefined) return undefined
-    return messages.map((message) => {
-      if (message !== claim.message) return message
-      const content = message.content.map(block => block !== null && typeof block === 'object' && block.type === 'text'
-        ? { ...block, text: removeMentionToken(block.text, resolved.name) }
-        : block)
-      return { ...message, content }
-    })
+    const bound = resolved ?? previous
+    if (bound !== undefined) {
+      mentionRoutes.set(sessionId, {
+        appId: bound.appId,
+        name: bound.name,
+        body: resolved === undefined ? claim.text : removeMentionToken(claim.text, resolved.name),
+      })
+    }
+    return undefined
   }
 
   /**
@@ -2228,11 +2665,50 @@ export function apply(ctx, config) {
    * an ADP failure becomes visible text plus a terminal chunk, so a broken app answers
    * in the conversation instead of blanking the turn.
    */
-  async function* streamMentionReply(sessionId, route, signal) {
-    yield { type: 'block-start', index: 0, blockType: 'text' }
-
-    /** Deltas the reducer produced but this generator has not yielded yet. */
+  async function* streamMentionReply(sessionId, route, signal, session) {
+    /**
+     * Parts the reducer produced but this generator has not yielded yet, each tagged with
+     * the DSH block it belongs to: an ADP `reply` streams as `text`, a `thought` and a
+     * `tool_call` stream as the folded `reasoning` block (思考过程).
+     */
     const queue = []
+    /** entry id → normalised kind / display fields, learned from the timeline patches. */
+    const entryKinds = new Map()
+    const entryLabels = new Map()
+    const announcedTools = new Set()
+    let lastReasoningId
+    const pushPart = (kind, text) => {
+      if (text === '') return
+      queue.push({ kind, text })
+      wake?.()
+      wake = undefined
+    }
+    const reasoningFrom = (name, patch) => {
+      if (settings.mentionReasoning === false || patch === null || typeof patch !== 'object') return
+      // `entry.*` replays the completed record; everything in it already streamed.
+      if (name.startsWith('entry.')) return
+      const id = patch.id
+      if (typeof patch.kind === 'string') entryKinds.set(id, patch.kind)
+      if (patch.tool || patch.name) {
+        entryLabels.set(id, { tool: patch.tool || entryLabels.get(id)?.tool || '', name: patch.name || entryLabels.get(id)?.name || '' })
+      }
+      const kind = entryKinds.get(id)
+      const separator = lastReasoningId !== undefined && lastReasoningId !== id ? '\n\n' : ''
+      if (kind === 'reasoning' && name === 'text.delta' && typeof patch.append === 'string' && patch.append !== '') {
+        pushPart('reasoning', separator + patch.append)
+        lastReasoningId = id
+        return
+      }
+      if (kind === 'tool' && !announcedTools.has(id)) {
+        const title = typeof patch.title === 'string' ? patch.title.trim() : ''
+        if (title === '' && patch.status !== 'done') return
+        const label = entryLabels.get(id)
+        const tool = label?.tool || label?.name || '工具'
+        announcedTools.add(id)
+        pushPart('reasoning', `${lastReasoningId === undefined ? '' : '\n\n'}🔧 ${tool}${title === '' ? '' : `：${title.slice(0, 200)}`}`)
+        lastReasoningId = id
+      }
+    }
     let wake
     let finished = false
     let failure
@@ -2260,11 +2736,9 @@ export function apply(ctx, config) {
           conversationId: mentionConversations.get(conversationKey),
           userId,
           signal: controller.signal,
-          onEvent: (_name, _payload, delta) => {
-            if (!delta) return
-            queue.push(delta)
-            wake?.()
-            wake = undefined
+          onEvent: (name, _payload, delta, patch) => {
+            if (delta) pushPart('text', delta)
+            reasoningFrom(String(name ?? ''), patch)
           },
           openConversation: async () => {
             const created = await createApiConversation(credentials, route.appId, appKey, userId, controller.signal)
@@ -2282,13 +2756,38 @@ export function apply(ctx, config) {
       }
     })()
 
-    let text = ''
+    /** The block currently open on the DSH stream, `{ index, type, text }`, or null. */
+    let open = null
+    let nextIndex = 0
+    let textBlocks = 0
+    /** Every answer part streamed so far, to reconcile with the authoritative completion. */
+    let streamedAnswer = ''
+    const closeOpen = function* (finalText) {
+      if (open === null) return
+      const text = finalText ?? open.text
+      yield { type: 'block-end', index: open.index, block: { type: open.type, text } }
+      open = null
+    }
+    const emit = function* (kind, text) {
+      if (open === null || open.type !== kind) {
+        yield* closeOpen()
+        open = { index: nextIndex, type: kind, text: '' }
+        nextIndex += 1
+        if (kind === 'text') textBlocks += 1
+        yield { type: 'block-start', index: open.index, blockType: kind }
+      }
+      // A paragraph break when the answer resumes after a folded reasoning block.
+      const chunk = kind === 'text' && open.text === '' && streamedAnswer !== '' ? text.replace(/^\n+/u, '') : text
+      open.text += chunk
+      if (kind === 'text') streamedAnswer += chunk
+      yield { type: kind === 'text' ? 'text-delta' : 'reasoning-delta', index: open.index, text: chunk }
+    }
+
     try {
       for (;;) {
         if (queue.length > 0) {
-          const delta = queue.shift()
-          text += delta
-          yield { type: 'text-delta', index: 0, text: delta }
+          const part = queue.shift()
+          yield* emit(part.kind, part.text)
           continue
         }
         if (finished) break
@@ -2302,34 +2801,111 @@ export function apply(ctx, config) {
     await chat
 
     // The completion frame restates the whole answer; stream the part the deltas did
-    // not carry so the visible text never loses its tail.
+    // not carry so the visible text never loses its tail. A single-block answer that
+    // diverged is replaced wholesale at close.
+    let replacement
     const authoritative = typeof result?.text === 'string' ? result.text : ''
-    if (authoritative !== '' && authoritative !== text) {
-      if (authoritative.startsWith(text)) yield { type: 'text-delta', index: 0, text: authoritative.slice(text.length) }
-      text = authoritative
-    }
-    const forms = renderInteractions(result?.interactions)
-    if (forms !== '') {
-      const addition = `${text === '' ? '' : '\n\n'}${forms}`
-      text += addition
-      yield { type: 'text-delta', index: 0, text: addition }
-    }
-    if (failure !== undefined) {
-      const aborted = signal?.aborted === true || failure?.name === 'AbortError'
-      const message = failure instanceof Error ? failure.message : String(failure)
-      if (aborted) {
-        if (text !== '') yield { type: 'block-end', index: 0, block: { type: 'text', text } }
-        yield { type: 'finish', reason: { kind: 'aborted', failure: { message, code: 'ABORTED' } } }
-        return
+    if (authoritative !== '' && authoritative !== streamedAnswer) {
+      if (authoritative.startsWith(streamedAnswer)) {
+        yield* emit('text', authoritative.slice(streamedAnswer.length))
+      } else if (textBlocks === 0 || (textBlocks === 1 && open?.type === 'text')) {
+        if (open?.type !== 'text') yield* emit('text', '')
+        replacement = authoritative
       }
-      const addition = `${text === '' ? '' : '\n\n'}> ⚠️ ADP 会话失败：${message}`
-      text += addition
-      yield { type: 'text-delta', index: 0, text: addition }
+    }
+    /** Sections appended after the answer; they survive a wholesale replacement. */
+    let appendix = ''
+    const append = function* (text) {
+      const separator = open?.type === 'text' && (replacement ?? open.text) !== '' ? '\n\n' : ''
+      appendix += separator + text
+      yield* emit('text', separator + text)
+    }
+
+    const aborted = failure !== undefined && (signal?.aborted === true || failure?.name === 'AbortError')
+    const files = collectTurnFiles(result)
+    if (!aborted && files.length > 0) await landFiles(files, session, signal)
+    const nonFiles = (Array.isArray(result?.interactions) ? result.interactions : []).filter(item => item?.kind !== 'file')
+    const tail = renderInteractions([...nonFiles, ...files.map(file => ({ kind: 'file', ...file }))])
+
+    // The block-end text is what the Session log keeps, so the final answer is where the
+    // inline COS links are pointed at the workspace copies.
+    const answerText = () => rewriteFileLinks(replacement === undefined ? open?.text ?? '' : replacement + appendix, files)
+    if (aborted) {
+      if (open !== null) yield* closeOpen(open.type === 'text' ? answerText() : undefined)
+      const message = failure instanceof Error ? failure.message : String(failure)
+      yield { type: 'finish', reason: { kind: 'aborted', failure: { message, code: 'ABORTED' } } }
+      return
+    }
+    if (tail !== '') yield* append(tail)
+    if (failure !== undefined) {
+      const message = failure instanceof Error ? failure.message : String(failure)
+      yield* append(`> ⚠️ ADP 会话失败：${message}`)
       console.error(`[adp-console] @${route.name} 会话失败：${message}`)
     }
-    if (text === '') text = '（ADP 应用没有返回任何内容。）'
-    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    if (textBlocks === 0) yield* emit('text', '（ADP 应用没有返回任何内容。）')
+    yield* closeOpen(open?.type === 'text' ? answerText() : undefined)
     yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+
+  /**
+   * Every file the turn produced, from the final interactions and the timeline entries,
+   * de-duplicated by URL (signatures and query strings rotate) and capped per turn.
+   */
+  function collectTurnFiles(result) {
+    const out = []
+    const seen = new Set()
+    const add = (file) => {
+      if (file === null || typeof file !== 'object') return
+      const key = fileUrlKey(file.url) || `name:${file.name}`
+      if (key === 'name:' || seen.has(key)) return
+      seen.add(key)
+      out.push({ name: file.name ?? '', url: file.url ?? '', size: file.size ?? null, type: file.type ?? '' })
+    }
+    for (const item of Array.isArray(result?.interactions) ? result.interactions : []) {
+      if (item?.kind === 'file') add(item)
+    }
+    for (const entry of Array.isArray(result?.timeline) ? result.timeline : []) {
+      for (const file of Array.isArray(entry?.files) ? entry.files : []) add(file)
+    }
+    return out
+  }
+
+  /**
+   * Copy the turn's files into the Session workspace, in place on each descriptor
+   * (`localPath` + `bytes` on success, `error` otherwise). A missing workspace or a
+   * disabled setting leaves every file on its remote link.
+   */
+  async function landFiles(files, session, signal) {
+    if (settings.fileDownload === false) return
+    const cwd = session?.header?.cwd
+    if (typeof cwd !== 'string' || cwd === '') return
+    let copied = 0
+    for (const file of files) {
+      if (signal?.aborted === true) return
+      if (copied >= settings.fileDownloadMaxFiles) {
+        file.error = `单轮最多保存 ${settings.fileDownloadMaxFiles} 个文件`
+        continue
+      }
+      if (file.url === '') continue
+      try {
+        const saved = await downloadAdpFile({
+          url: file.url,
+          name: file.name,
+          cwd,
+          dir: settings.fileDownloadDir,
+          hosts: settings.fileDownloadHosts,
+          maxBytes: settings.fileDownloadMaxBytes,
+          timeoutMs: settings.fileDownloadTimeoutMs,
+          signal,
+        })
+        file.localPath = saved.localPath
+        file.bytes = saved.bytes
+        copied += 1
+      } catch (error) {
+        file.error = error instanceof Error ? error.message : String(error)
+        console.error(`[adp-console] 无法保存 ADP 文件 ${file.name || file.url.split('?')[0]}：${file.error}`)
+      }
+    }
   }
 
   if (settings.mentionEnabled !== false) {
@@ -2347,7 +2923,9 @@ export function apply(ctx, config) {
       const sessionId = String(options.sessionId)
       const route = mentionRoutes.get(sessionId)
       if (route === undefined) return next()
-      return streamMentionReply(sessionId, route, options.signal)
+      // Optional: without the Session registry the files keep their remote links.
+      const session = ctx.get('sessions')?.get?.(options.sessionId)
+      return streamMentionReply(sessionId, route, options.signal, session)
     }), 'adp-console: @ mention bridge')
 
     ctx.effect(() => ctx.on('session/disposed', (session) => {

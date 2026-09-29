@@ -173,7 +173,8 @@ function chatResponse(rawBody, res) {
     frame({ Type: 'message.added', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Name: '执行命令', ExtraInfo: { ToolName: 'bash' }, Contents: [{ Type: 'json_text' }] } })
     frame({ Type: 'message.processing', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Title: 'ls -la /workdir', Status: 'processing', ExtraInfo: { ToolName: 'bash', Elapsed: '7101' } } })
     frame({ Type: 'text.replace', MessageId: 'c1', Text: 'total 16\ndrwxr-xr-x 2 root root' })
-    frame({ Type: 'content.added', MessageId: 'c1', ContentIndex: 1, Content: { Type: 'file', FileName: 'out.txt', FileUrl: 'https://example.com/out.txt' } })
+    // Real wire shape: the metadata is nested in `Content.File` (a FileInfo).
+    frame({ Type: 'content.added', MessageId: 'c1', ContentIndex: 1, Content: { Type: 'file', File: { FileName: 'out.txt', FileUrl: 'https://example.com/out.txt', FileSize: '12', FileType: 'txt' } } })
     frame({ Type: 'message.done', MessageId: 'c1', Message: { Type: 'tool_call', MessageId: 'c1', Status: 'success', Contents: [{ Type: 'json_text' }] } })
     frame({
       Type: 'response.completed',
@@ -182,7 +183,7 @@ function chatResponse(rawBody, res) {
         Messages: [
           { Type: 'thought', MessageId: 't1', Contents: [{ Type: 'text', Text: '先看看目录。' }] },
           { Type: 'reply', MessageId: 'r1', Contents: [{ Type: 'text', Text: '我先看一下工作目录。' }] },
-          { Type: 'tool_call', MessageId: 'c1', Name: '执行命令', ExtraInfo: { ToolName: 'bash' }, Contents: [{ Type: 'file', FileName: 'out.txt', FileUrl: 'https://example.com/out.txt' }] },
+          { Type: 'tool_call', MessageId: 'c1', Name: '执行命令', ExtraInfo: { ToolName: 'bash' }, Contents: [{ Type: 'file', File: { FileName: 'out.txt', FileUrl: 'https://example.com/out.txt', FileSize: '12', FileType: 'txt' } }] },
         ],
       },
     })
@@ -1384,8 +1385,8 @@ const textOf = chunks => chunks.filter(chunk => chunk.type === 'text-delta').map
 
 const firstDecision = await preStep(mentionHarness, SESSION, [userOf('m1', '@客服助手 帮我看下数据')])
 check(
-  'the mention never reaches the model prompt',
-  mod.messageTextOf(firstDecision.messages[0]) === '帮我看下数据',
+  'the mention stays in the message the transcript renders',
+  mod.messageTextOf(firstDecision.messages[0]) === '@客服助手 帮我看下数据',
   JSON.stringify(mod.messageTextOf(firstDecision.messages[0])),
 )
 check('the pre-step keeps its own decision shape', firstDecision.kind === 'enter' && firstDecision.messages.length === 1)
@@ -1443,8 +1444,8 @@ check('an auxiliary model call is never routed to the app', titled.fellThrough =
 await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: SESSION, appId: null, token: 'DSH' }))
 const exitDecision = await preStep(mentionHarness, SESSION, [userOf('m3', '@DSH 你好')])
 check(
-  'the exit mention is stripped from the prompt too',
-  mod.messageTextOf(exitDecision.messages[0]) === '你好',
+  'the exit mention stays visible in the message too',
+  mod.messageTextOf(exitDecision.messages[0]) === '@DSH 你好',
   JSON.stringify(mod.messageTextOf(exitDecision.messages[0])),
 )
 const exited = await streamTurn(mentionHarness, SESSION)
@@ -1453,7 +1454,7 @@ check('after the exit the model owns the turn again', exited.fellThrough === tru
 // A mention typed or pasted by hand has no pick behind it; the enabled-app index is
 // what keeps it working, which is also what makes a mention survive being copied.
 const typed = await preStep(mentionHarness, 'session-mention-typed', [userOf('t1', '@客服助手 你好')])
-check('a hand-typed mention resolves against the enabled apps', mod.messageTextOf(typed.messages[0]) === '你好')
+check('a hand-typed mention resolves against the enabled apps', mod.messageTextOf(typed.messages[0]) === '@客服助手 你好')
 const typedTurn = await streamTurn(mentionHarness, 'session-mention-typed')
 check('...and routes to the same app', typedTurn.fellThrough === false && textOf(typedTurn.chunks).includes(REPLY_TEXT))
 
@@ -1461,7 +1462,7 @@ check('...and routes to the same app', typedTurn.fellThrough === false && textOf
 const typedExit = await preStep(mentionHarness, 'session-mention-typed', [userOf('t2', '@DSH 换我问你')])
 check(
   'a hand-typed @DSH also releases the session',
-  mod.messageTextOf(typedExit.messages[0]) === '换我问你' && (await streamTurn(mentionHarness, 'session-mention-typed')).fellThrough === true,
+  mod.messageTextOf(typedExit.messages[0]) === '@DSH 换我问你' && (await streamTurn(mentionHarness, 'session-mention-typed')).fellThrough === true,
 )
 
 // 下架 after the bind: the gate outranks the binding, and the answer says why.
@@ -1762,23 +1763,39 @@ check(
 // 320-420px. The list is a selector, so it is the narrow column.
 check(
   'the conversation pane is the flexible column and the list is narrow',
-  /\.adp-body\{display:grid;grid-template-columns:minmax\(260px,320px\) minmax\(0,1fr\)/.test(panelCss),
+  /\.adp-body\{display:grid;grid-template-columns:minmax\(\d+px,\d+px\) minmax\(0,1fr\)/.test(panelCss),
   (/\.adp-body\{[^}]*/.exec(panelCss) ?? [''])[0].slice(0, 120),
+)
+// The body rule once closed early, orphaning `flex:1 1 auto;min-height:0}`; the two
+// columns then never filled the height and the chat grew the page instead of scrolling.
+check(
+  'the two columns fill the remaining height',
+  /\.adp-body\{[^}]*flex:1 1 auto[^}]*\}/.test(panelCss)
+    && !/\}flex:1 1 auto;min-height:0\}/.test(panelCss),
+  (/\.adp-body\{[^}]*/.exec(panelCss) ?? [''])[0].slice(0, 160),
+)
+// The catalogue row and the timeline step shared `.adp-row`, so the step's
+// `flex-direction:column` stacked the catalogue row vertically.
+check(
+  'catalogue rows and timeline steps do not share a class',
+  /\.adp-app\{display:flex;flex-direction:row/.test(panelCss)
+    && !/\.adp-row[.{:\s]/.test(panelCss)
+    && !clientSource.includes("className: `adp-row"),
 )
 // Process rows carry the steps; the answer carries the content. The host dims reasoning
 // to label-tertiary and tool rows to label-secondary for exactly this reason.
 check(
   'process rows are visually weakened against the answer',
   /\.adp-rowhead\{display:flex[^}]*color:var\(--dsw-alias-label-tertiary\)/.test(panelCss)
-    && /\.adp-row\.tool \.adp-rowhead\{color:var\(--dsw-alias-label-secondary\)\}/.test(panelCss),
+    && /\.adp-step\.tool \.adp-rowhead\{color:var\(--dsw-alias-label-secondary\)\}/.test(panelCss),
   (/\.adp-rowhead\{[^}]*/.exec(panelCss) ?? [''])[0].slice(0, 160),
 )
 check(
   'the row shows only the ADP status beside the gate switch, not both',
   (() => {
-    const at = clientSource.indexOf("h('div', { className: 'adp-tags' }")
-    const row = clientSource.slice(at, clientSource.indexOf("h('button', {", at))
-    return at > 0 && row.includes('adp-pill ${statusKey}') && !row.includes("t('gateOn')")
+    const start = clientSource.indexOf('    function AppRow(props) {')
+    const row = clientSource.slice(start, clientSource.indexOf('\n    }\n', start))
+    return start > 0 && row.includes('adp-pill ${statusKey}') && !row.includes("t('gateOn')")
   })(),
 )
 
@@ -1805,6 +1822,154 @@ check(
   'a long summary is truncated',
   toolSummary(`websearch({"query": "${'x'.repeat(200)}"})`).length === 90,
 )
+
+/* ------------------------------------------------------------------ *
+ * ADP → DSH field mapping (files, references, reasoning)
+ * ------------------------------------------------------------------ */
+
+const nested = mod.fileInfoOf({ Type: 'file', File: { FileName: 'agent-intro.html', FileUrl: 'https://agent-oa.adp-cos.com/a/b/agent-intro.html?q-signature=x', FileSize: '20480', FileType: 'html' } })
+check(
+  'a file is read from the nested Content.File the protocol sends',
+  nested.name === 'agent-intro.html' && nested.url.startsWith('https://agent-oa.adp-cos.com/') && nested.size === 20480 && nested.type === 'html',
+  JSON.stringify(nested),
+)
+check(
+  'the flat spelling still works as a fallback',
+  mod.fileInfoOf({ Type: 'file', FileName: 'a.txt', FileUrl: 'https://x.adp-cos.com/a.txt' }).name === 'a.txt',
+)
+check(
+  'a nameless file borrows the URL basename',
+  mod.fileInfoOf({ Type: 'file', File: { FileUrl: 'https://x.adp-cos.com/dir/%E6%8A%A5%E5%91%8A.xlsx?sig=1' } }).name === '报告.xlsx',
+)
+const refs = mod.referencesOf({ References: [
+  { Name: '产品手册', Url: 'https://docs.example.com/manual' },
+  { DocRefer: { DocName: '内部 FAQ', Url: 'https://kb.example.com/faq' } },
+  { WebSearchRefer: { Url: 'https://news.example.com/a' } },
+  { Name: '产品手册', Url: 'https://docs.example.com/manual' },
+  { Url: 'javascript:alert(1)' },
+] })
+check(
+  'references keep navigable sources, de-duplicated, and drop script URLs',
+  refs.length === 3 && refs[1].title === '内部 FAQ' && refs[2].url === 'https://news.example.com/a',
+  JSON.stringify(refs),
+)
+const rendered = mod.renderFiles([
+  { name: 'agent intro.html', url: 'https://agent-oa.adp-cos.com/x/agent-intro.html?sig=1', size: 20480, type: 'html', localPath: 'adp-output/agent intro.html', bytes: 20480 },
+  { name: 'chart.png', url: 'https://agent-oa.adp-cos.com/x/chart.png', localPath: 'adp-output/chart.png' },
+  { name: 'big.zip', url: 'https://agent-oa.adp-cos.com/x/big.zip', error: '文件超过 50 MB 上限' },
+  { name: 'ghost.txt', url: '' },
+])
+check(
+  'a copied file links its workspace path, percent-encoded for the file-link parser',
+  rendered.includes('[agent intro.html](adp-output/agent%20intro.html) · 20 KB · html'),
+  rendered,
+)
+check('a copied image also renders inline', rendered.includes('![chart.png](adp-output/chart.png)'), rendered)
+check(
+  'a file that could not be copied keeps its download link and says why',
+  rendered.includes('[big.zip](https://agent-oa.adp-cos.com/x/big.zip)（未保存到工作区：文件超过 50 MB 上限）'),
+  rendered,
+)
+check('a file without a URL says so instead of a dead link', rendered.includes('ghost.txt（ADP 没有返回可下载的地址）'), rendered)
+check(
+  'the answer\'s own COS link is pointed at the workspace copy, whatever its signature',
+  mod.rewriteFileLinks(
+    '文件位置：[/workdir/output/agent-intro.html](https://agent-oa.adp-cos.com/x/agent-intro.html?q-signature=other)',
+    [{ url: 'https://agent-oa.adp-cos.com/x/agent-intro.html?q-signature=first', localPath: 'adp-output/agent-intro.html' }],
+  ) === '文件位置：[/workdir/output/agent-intro.html](adp-output/agent-intro.html)',
+)
+check(
+  'an unrelated link is left alone',
+  mod.rewriteFileLinks('[x](https://example.com/y)', [{ url: 'https://agent-oa.adp-cos.com/x/y', localPath: 'adp-output/y' }]) === '[x](https://example.com/y)',
+)
+
+check(
+  'downloads only go to public addresses',
+  ['8.8.8.8', '43.137.0.1', '2402:4e00::1'].every(mod.isPublicAddress)
+    && ['127.0.0.1', '10.1.2.3', '9.1.1.1', '11.0.0.1', '21.3.3.3', '30.1.1.1', '172.16.0.1', '192.168.1.1',
+      '169.254.169.254', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1',
+      '::ffff:7f00:1', '64:ff9b::10.0.0.1'].every(address => !mod.isPublicAddress(address)),
+)
+const hosts = mod.DEFAULT_CONFIG.fileDownloadHosts
+check(
+  'download URLs must be HTTPS on an allowed host name',
+  mod.isAllowedDownloadUrl('https://agent-oa.adp-cos.com/a.html', hosts)
+    && mod.isAllowedDownloadUrl('https://bucket-1250000000.cos.ap-guangzhou.myqcloud.com/a', hosts)
+    && !mod.isAllowedDownloadUrl('http://agent-oa.adp-cos.com/a.html', hosts)
+    && !mod.isAllowedDownloadUrl('https://evil-adp-cos.com/a', hosts)
+    && !mod.isAllowedDownloadUrl('https://adp-cos.com.evil.io/a', hosts)
+    && !mod.isAllowedDownloadUrl('https://user:pw@agent-oa.adp-cos.com/a', hosts)
+    && !mod.isAllowedDownloadUrl('https://agent-oa.adp-cos.com:8443/a', hosts)
+    && !mod.isAllowedDownloadUrl('https://127.0.0.1/a', ['127.0.0.1']),
+)
+check(
+  'a reported file name can never leave its directory',
+  mod.safeFileName('../../etc/passwd') === 'passwd' && mod.safeFileName('..') === 'file'
+    && mod.safeFileName('a\\..\\b.txt') === 'b.txt' && mod.safeFileName('re?port<1>.txt') === 're_port_1_.txt'
+    && mod.safeFileName(`${'x'.repeat(300)}.html`).length === 120 && mod.safeFileName(`${'x'.repeat(300)}.html`).endsWith('.html'),
+)
+const workspace = await mkdtemp(join(tmpdir(), 'adp-workspace-'))
+let refusedHost = ''
+try {
+  await mod.downloadAdpFile({ url: 'https://example.com/x', name: 'x', cwd: workspace, dir: 'adp-output', hosts, maxBytes: 10, timeoutMs: 1000 })
+} catch (error) {
+  refusedHost = error.message
+}
+check('a download from an unlisted host is refused before any connection', refusedHost.includes('不在允许'), refusedHost)
+let refusedDir = ''
+try {
+  await mod.downloadAdpFile({ url: 'https://agent-oa.adp-cos.com/x', name: 'x', cwd: workspace, dir: '../outside', hosts, maxBytes: 10, timeoutMs: 1000 })
+} catch (error) {
+  refusedDir = error.message
+}
+check('the download directory cannot point outside the workspace', refusedDir.includes('相对路径'), refusedDir)
+let refusedLookup = ''
+try {
+  await mod.downloadAdpFile({
+    url: 'https://agent-oa.adp-cos.com/x', name: 'x', cwd: workspace, dir: 'adp-output', hosts, maxBytes: 10, timeoutMs: 5000,
+    // A rebinding answer: the allowed name resolves to the metadata service.
+    lookup: (_host, _options, callback) => callback(Object.assign(new Error('拒绝连接非公网地址'), { code: 'EADDRNOTPUBLIC' })),
+  })
+} catch (error) {
+  refusedLookup = error.message
+}
+check(
+  'a host that resolves to a private address is refused and leaves no partial file',
+  refusedLookup.includes('非公网') && !existsSync(join(workspace, 'adp-output', 'x')),
+  refusedLookup,
+)
+
+// The whole turn, through the `llm/stream` seam, with a Session workspace available.
+mentionHarness.ctx.get = name => (name === 'sessions' ? { get: () => ({ header: { cwd: workspace } }) } : undefined)
+await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: 'session-map', appId: APP_RUNNING, token: '客服助手' }))
+await preStep(mentionHarness, 'session-map', [userOf('map1', '@客服助手 TIMELINE')])
+const mapped = await streamTurn(mentionHarness, 'session-map')
+const blocks = mapped.chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block)
+const reasoning = blocks.filter(block => block.type === 'reasoning').map(block => block.text).join('\n')
+const answer = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n')
+check(
+  'an ADP thought streams as the folded DSH reasoning block',
+  reasoning.includes('先看看目录。') && mapped.chunks.some(chunk => chunk.type === 'reasoning-delta'),
+  reasoning,
+)
+check('an ADP tool call is summarised inside the reasoning block', reasoning.includes('🔧 bash：ls -la /workdir'), reasoning)
+check('the ADP reply is the text block', answer.includes('我先看一下工作目录。') && !answer.includes('先看看目录'), answer)
+check(
+  'every block opened is closed, in index order',
+  mapped.chunks.filter(chunk => chunk.type === 'block-start').map(chunk => chunk.index).join()
+    === mapped.chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.index).join(),
+)
+check(
+  'the produced file is listed by name with its size, not as a nameless 「产出文件」',
+  answer.includes('**产出文件**') && answer.includes('[out.txt](https://example.com/out.txt) · 12 B · txt'),
+  answer,
+)
+check(
+  'an unlisted host keeps the remote link and explains it was not copied',
+  answer.includes('未保存到工作区') && !existsSync(join(workspace, 'adp-output', 'out.txt')),
+  answer,
+)
+check('the reasoning mapping can be switched off', mod.DEFAULT_CONFIG.mentionReasoning === true && mod.DEFAULT_CONFIG.fileDownload === true)
 
 gateway.close()
 
