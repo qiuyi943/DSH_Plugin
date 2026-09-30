@@ -18,16 +18,20 @@
 # Credentials themselves come from the environment when this config leaves them empty
 # (TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY), and can also be saved from the
 # panel, which writes <DSH_HOME>/adp-console/state.json (mode 0600).
-# `spaceId` is the SpaceId the API expects, NOT the space name. On this standalone site
-# the only space is *named* `default_space` but its id is `bfnUUoSh`; passing the name
-# fails with `4510004-当前空间下没有该用户信息`. `node test/spaces.mjs` (or the
+# `spaceId` is the SpaceId the API expects, NOT the space name: a space *named*
+# `default_space` has a different id, and passing the name fails with
+# `4510004-当前空间下没有该用户信息`. `node test/spaces.mjs` (or the
 # `adp_list_spaces` tool) lists the real ids.
+#
+# `site`, `endpoint`, `chatEndpoint` and `spaceId` are left empty so each user picks
+# them in the panel's 「设置」: an empty site falls back to 腾讯云 (`cn`), and empty
+# endpoints are derived from the site.
 - insert:
     - id: adp-console
       name: './lib/entry.js'
       config:
-        site: standalone
-        endpoint: capi.adp.tencent.com
-        chatEndpoint: https://adp.tencent.com/adp/v2/chat
+        site: ''
+        endpoint: ''
+        chatEndpoint: ''
         region: ap-guangzhou
-        spaceId: bfnUUoSh
+        spaceId: ''
