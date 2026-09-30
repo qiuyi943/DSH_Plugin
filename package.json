@@ -1,0 +1,30 @@
+{
+  "name": "@qiuyi943/dsh-plugins",
+  "version": "1.4.0",
+  "private": true,
+  "description": "DSH plugin collection. Installing this repository installs every bundle below: adp-console (Tencent Cloud ADP agent apps: catalogue, publish gate, chat, and @-mention bridge).",
+  "icon": "./adp-console/icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qiuyi943/DSH_Plugin.git"
+  },
+  "files": [
+    "adp-console/package.json",
+    "adp-console/lib",
+    "adp-console/client.js",
+    "adp-console/icon.svg",
+    "adp-console/cordis.patch.yml",
+    "adp-console/locale",
+    "adp-console/README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./adp-console/cordis.patch.yml"
+      ]
+    }
+  },
+  "dependencies": {
+    "tencentcloud-sdk-nodejs-adp": "^4.1.316"
+  }
+}

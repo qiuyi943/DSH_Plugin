@@ -10,6 +10,34 @@ DeepSeek Harness（DSH）插件集合。每个子目录是一个可独立安装�
 
 ## 安装
 
+### 从 GitHub 安装（推荐）
+
+在 DSH「插件」页选择 Git 仓库，填入仓库地址即可：
+
+```
+https://github.com/qiuyi943/DSH_Plugin
+```
+
+或在命令行：`dsh plugin add github:qiuyi943/DSH_Plugin`（可在末尾加 `#<commit>` 锁定版本）。
+
+DSH 把地址原样交给 `pnpm add`，装完读取**仓库根目录**的 `package.json`，要求它声明
+`dsh.bundle.patch`，否则报「这个包没有声明组合包，不能作为插件管理」。所以仓库根目录有一个
+集合 bundle `@qiuyi943/dsh-plugins`：
+
+- `dsh.bundle.patch` 列出每个插件的 `cordis.patch.yml`；patch 里的 `./lib/entry.js` 按 patch
+  文件所在目录解析，所以指向 `adp-console/lib/entry.js`；
+- 面板（Client 半边）由 DSH 从插件入口向上找到最近的 `adp-console/package.json` 读取 `dsh.client`；
+- `files` 只打包运行所需的文件（git 安装会按 `files` 打包，测试与 `node_modules` 不会带上）；
+- 插件的 npm 依赖（`tencentcloud-sdk-nodejs-adp`）声明在根 `package.json`，由 DSH 安装到
+  profile；缺失时插件回退到内置 TC3 签名。
+
+**新增插件时**，把它的 `cordis.patch.yml` 加进根 `package.json` 的 `dsh.bundle.patch`，
+运行所需文件加进 `files`，npm 依赖加进 `dependencies`。插件代码不能依赖构建步骤：git 安装不跑 `build`。
+
+同一个 profile 里不要同时装 GitHub 版和下面的本地目录版：两者插入的是同一个 `adp-console` 行。
+
+### 从本地目录安装（开发用）
+
 插件通过 `plugin_manager` 以 bundle 形式安装，`target` 指向**包目录**：
 
 ```

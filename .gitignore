@@ -9,3 +9,9 @@ dist/
 # 插件运行时状态（密钥等，永远不要提交）
 state.json
 *.tmp
+
+# ADP 智能体复制到工作区的产出文件
+adp-output/
+
+# DSH 崩溃排查材料
+crash-analysis/
