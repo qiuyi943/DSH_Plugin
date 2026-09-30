@@ -192,6 +192,36 @@ function chatResponse(rawBody, res) {
     globalThis.__lastChatBody = body
     return
   }
+  // A Claw turn as the live endpoint narrates it: progress replies between steps, raw
+  // tool invocations as titles, a sub-agent, a corrected (`text.replace`) and a
+  // tail-less (completed only by `message.done`) final reply, and a sandbox file ADP
+  // reports as 0 bytes.
+  if (body?.Contents?.[0]?.Text === 'CLAW') {
+    frame({ Type: 'message.added', MessageId: 'k-t1', Message: { Type: 'thought', MessageId: 'k-t1', Status: 'processing' } })
+    frame({ Type: 'content.added', MessageId: 'k-t1', ContentIndex: 0, Content: { Type: 'text', Text: '用户要一份 PPT，' } })
+    frame({ Type: 'text.delta', MessageId: 'k-t1', ContentIndex: 0, Text: '先加载技能。' })
+    frame({ Type: 'message.done', MessageId: 'k-t1', Message: { Type: 'thought', MessageId: 'k-t1', Status: 'success' } })
+    frame({ Type: 'message.added', MessageId: 'k-r1', Message: { Type: 'reply', MessageId: 'k-r1', Status: 'processing' } })
+    frame({ Type: 'text.delta', MessageId: 'k-r1', ContentIndex: 0, Text: '首先加载 PPT 制作技能。' })
+    frame({ Type: 'message.done', MessageId: 'k-r1', Message: { Type: 'reply', MessageId: 'k-r1', Status: 'success', Contents: [{ Type: 'text', Text: '首先加载 PPT 制作技能。' }] } })
+    frame({ Type: 'message.added', MessageId: 'k-c1', Message: { Type: 'tool_call', MessageId: 'k-c1', Name: 'Agent', Title: '工具执行', ExtraInfo: { ToolName: 'Agent' } } })
+    frame({ Type: 'message.processing', MessageId: 'k-c1', Message: { Type: 'tool_call', MessageId: 'k-c1', Title: 'Agent({"description": "研究并生成大纲", "prompt": "你是一位 PPT 内容策划专家……"})', Status: 'processing', ExtraInfo: { ToolName: 'Agent' } } })
+    frame({ Type: 'message.added', MessageId: 'k-s1', Message: { Type: 'reply', MessageId: 'k-s1', ExtraInfo: { IsSubAgent: true, ParentMessageId: 'k-c1' } } })
+    frame({ Type: 'text.delta', MessageId: 'k-s1', ContentIndex: 0, Text: 'SUBAGENT-REPORT：大纲共 13 页。' })
+    frame({ Type: 'message.done', MessageId: 'k-c1', Message: { Type: 'tool_call', MessageId: 'k-c1', Title: '工具执行', Status: 'success' } })
+    frame({ Type: 'message.added', MessageId: 'k-c2', Message: { Type: 'tool_call', MessageId: 'k-c2', ExtraInfo: { ToolName: 'bash' } } })
+    frame({ Type: 'message.processing', MessageId: 'k-c2', Message: { Type: 'tool_call', MessageId: 'k-c2', Title: 'python3 render.py', ExtraInfo: { ToolName: 'bash' } } })
+    frame({ Type: 'message.done', MessageId: 'k-c2', Message: { Type: 'tool_call', MessageId: 'k-c2', Status: 'failed' } })
+    frame({ Type: 'message.added', MessageId: 'k-r2', Message: { Type: 'reply', MessageId: 'k-r2', Status: 'processing' } })
+    frame({ Type: 'text.delta', MessageId: 'k-r2', ContentIndex: 0, Text: '大纲已完成，' })
+    frame({ Type: 'text.replace', MessageId: 'k-r2', ContentIndex: 0, Text: '大纲已完成，请确认' })
+    frame({ Type: 'message.done', MessageId: 'k-r2', Message: { Type: 'reply', MessageId: 'k-r2', Status: 'success', Contents: [{ Type: 'text', Text: '大纲已完成，请确认插图方案。' }, { Type: 'file', File: { FileName: 'outline.md', FileUrl: 'https://sandbox.example.com/files?path=/workdir/outline.md', FileSize: '0', FileType: 'md' } }] } })
+    frame({ Type: 'response.completed', Response: { RecordId: 'r1', Status: 'success' } })
+    res.write('event: done\ndata: [DONE]\n\n')
+    res.end()
+    globalThis.__lastChatBody = body
+    return
+  }
   // A Claw agent narrates each step as its own reply; two of them must not be glued.
   if (body?.Contents?.[0]?.Text === 'MULTI') {
     frame({ Type: 'message.added', MessageId: 's1', Message: { Type: 'reply', MessageId: 's1', Contents: [{ Type: 'text' }] } })
@@ -662,8 +692,64 @@ check(
   JSON.stringify(lastPayload),
 )
 
+// The regression behind 「SecretId 和 SecretKey 必须同时提供」 on a second save: the form
+// never gets the secrets back, so it submits them empty — which used to delete them.
+const resaved = await secondary.call('POST', '/config', JSON.stringify({
+  secretId: '', secretKey: '', region: 'ap-shanghai', spaceId: 'space-edited', site: 'cn',
+}))
+check(
+  'a second save with the secret fields left empty keeps the saved key pair',
+  resaved.json.ok === true && resaved.json.configured === true && resaved.json.source === 'panel'
+    && resaved.json.region === 'ap-shanghai' && resaved.json.spaceId === 'space-edited',
+  JSON.stringify(resaved.json),
+)
+check(
+  'saving only the preferences keeps the key pair too',
+  (await secondary.call('POST', '/config', JSON.stringify({ spaceId: 'space-from-panel' }))).json.configured === true,
+)
+const refusedHalf = await secondary.call('POST', '/config', JSON.stringify({ secretId: 'AKIDnew', secretKey: '', spaceId: 'must-not-apply' }))
+const afterRefusal = (await secondary.call('GET', '/config')).json
+const stateAfterRefusal = JSON.parse(await readFile(secondaryStatePath, 'utf8'))
+check(
+  'a refused save changes nothing, in memory or on disk',
+  refusedHalf.json.ok === false && afterRefusal.configured === true && afterRefusal.spaceId === 'space-from-panel'
+    && afterRefusal.secretIdHint === 'AKID****0000' && stateAfterRefusal.credentials?.secretKey === 'SECRETpanel0000000000',
+  JSON.stringify({ refusedHalf: refusedHalf.json, afterRefusal }),
+)
+check(
+  'a pasted key with inner whitespace is refused instead of saved broken',
+  (await secondary.call('POST', '/config', JSON.stringify({ secretId: 'AKID abc', secretKey: 'KEY' }))).json.ok === false,
+)
+check(
+  'the form rules hold as a pure function',
+  JSON.stringify(mod.applyCredentialForm({ secretId: 'A', secretKey: 'B', spaceId: 'S' }, { secretId: ' ', secretKey: '', region: '' }))
+    === JSON.stringify({ secretId: 'A', secretKey: 'B', spaceId: 'S' })
+    && mod.applyCredentialForm({ secretId: 'A', secretKey: 'B' }, { secretId: 'C', secretKey: 'D' }).secretKey === 'D',
+)
+
+const viewWithOverrides = (await secondary.call('GET', '/config')).json
+check(
+  'GET /config reports each preference\'s default and the panel\'s override, for 「已覆盖 · 恢复默认」',
+  viewWithOverrides.defaults?.region === 'ap-guangzhou' && viewWithOverrides.overrides?.region === 'ap-shanghai'
+    && viewWithOverrides.overrides?.spaceId === 'space-from-panel' && viewWithOverrides.overrides?.site === 'cn',
+  JSON.stringify({ defaults: viewWithOverrides.defaults, overrides: viewWithOverrides.overrides }),
+)
+check(
+  'an empty site re-inherits the plugin default instead of being refused',
+  mod.applyCredentialForm({ site: 'standalone', secretId: 'A', secretKey: 'B' }, { site: '' }).site === undefined,
+)
+check(
+  'a key outside printable ASCII is refused, exactly as DSH refuses an API key',
+  (() => { try { mod.applyCredentialForm({}, { secretId: 'AKID中文', secretKey: 'K' }); return false } catch { return true } })(),
+)
+
 const cleared = await secondary.call('POST', '/config', JSON.stringify({ clear: true }))
 check('POST /config can clear the credentials', cleared.json.configured === false, JSON.stringify(cleared.json))
+check(
+  'clearing the key keeps the region, space and site preferences',
+  cleared.json.spaceId === 'space-from-panel' && cleared.json.region === 'ap-shanghai',
+  JSON.stringify(cleared.json),
+)
 
 /* --- 8. Credential verification and auth diagnostics --- */
 const verifyBase = {
@@ -1861,16 +1947,49 @@ const rendered = mod.renderFiles([
 ])
 check(
   'a copied file links its workspace path, percent-encoded for the file-link parser',
-  rendered.includes('[agent intro.html](adp-output/agent%20intro.html) · 20 KB · html'),
+  rendered.includes('- [agent intro.html](adp-output/agent%20intro.html) · HTML · 20 KB'),
   rendered,
 )
-check('a copied image also renders inline', rendered.includes('![chart.png](adp-output/chart.png)'), rendered)
+check(
+  'a copied image renders inline as a DSH message image and is not listed again',
+  rendered.startsWith('![chart.png](adp-output/chart.png)') && !rendered.includes('- [chart.png]'),
+  rendered,
+)
 check(
   'a file that could not be copied keeps its download link and says why',
-  rendered.includes('[big.zip](https://agent-oa.adp-cos.com/x/big.zip)（未保存到工作区：文件超过 50 MB 上限）'),
+  rendered.includes('- [big.zip](https://agent-oa.adp-cos.com/x/big.zip) · *未保存到工作区：文件超过 50 MB 上限*'),
   rendered,
 )
-check('a file without a URL says so instead of a dead link', rendered.includes('ghost.txt（ADP 没有返回可下载的地址）'), rendered)
+check('a file without a URL says so instead of a dead link', rendered.includes('- ghost.txt · *ADP 没有返回可下载的地址*'), rendered)
+check(
+  'no emoji is put in front of a link DSH already decorates with its own icon',
+  !rendered.includes('📄') && !rendered.includes('原始下载'),
+  rendered,
+)
+const sandboxFiles = [
+  { name: 'slide-01.jpg', url: 'https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg', size: 0, type: 'jpg', error: '下载地址不在允许的 HTTPS 域名内' },
+  { name: 'slide-02.jpg', url: 'https://sandbox.adp.example.com/files?path=/workdir/slide-02.jpg', size: 0, type: 'jpg' },
+  { name: 'cover.png', url: 'https://agent.adp-cos.com/a/cover.png?sig=1', type: 'png' },
+]
+const sandboxRendered = mod.renderFiles(sandboxFiles, { inlineHosts: ['adp-cos.com'] })
+check(
+  'an image the browser cannot load is a link, not 「图片无法预览」; a public one is inlined',
+  !sandboxRendered.includes('![slide-01.jpg]') && sandboxRendered.includes('- [slide-01.jpg](https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg) · JPG ·')
+    && sandboxRendered.includes('![cover.png](https://agent.adp-cos.com/a/cover.png?sig=1)') && !sandboxRendered.includes('0 B'),
+  sandboxRendered,
+)
+check(
+  'the answer\'s own inline image of an unloadable file is demoted to a link',
+  mod.demoteUnloadableImages('看图：![第一页](https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg) 和 ![封面](https://agent.adp-cos.com/a/cover.png?sig=2)', sandboxFiles, ['adp-cos.com'])
+    === '看图：[第一页](https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg) 和 ![封面](https://agent.adp-cos.com/a/cover.png?sig=2)',
+)
+check(
+  'sandbox files that differ only by ?path= stay distinct files',
+  mod.rewriteFileLinks(
+    '[1](https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg) [2](https://sandbox.adp.example.com/files?path=/workdir/slide-02.jpg)',
+    [{ url: 'https://sandbox.adp.example.com/files?path=/workdir/slide-02.jpg&token=x', localPath: 'adp-output/slide-02.jpg' }],
+  ) === '[1](https://sandbox.adp.example.com/files?path=/workdir/slide-01.jpg) [2](adp-output/slide-02.jpg)',
+)
 check(
   'the answer\'s own COS link is pointed at the workspace copy, whatever its signature',
   mod.rewriteFileLinks(
@@ -1952,7 +2071,7 @@ check(
   reasoning.includes('先看看目录。') && mapped.chunks.some(chunk => chunk.type === 'reasoning-delta'),
   reasoning,
 )
-check('an ADP tool call is summarised inside the reasoning block', reasoning.includes('🔧 bash：ls -la /workdir'), reasoning)
+check('an ADP tool call is summarised inside the reasoning block', reasoning.includes('- 🔧 **bash** · `ls -la /workdir`'), reasoning)
 check('the ADP reply is the text block', answer.includes('我先看一下工作目录。') && !answer.includes('先看看目录'), answer)
 check(
   'every block opened is closed, in index order',
@@ -1961,7 +2080,7 @@ check(
 )
 check(
   'the produced file is listed by name with its size, not as a nameless 「产出文件」',
-  answer.includes('**产出文件**') && answer.includes('[out.txt](https://example.com/out.txt) · 12 B · txt'),
+  answer.includes('**产出文件**') && answer.includes('- [out.txt](https://example.com/out.txt) · TXT · 12 B'),
   answer,
 )
 check(
@@ -1970,6 +2089,154 @@ check(
   answer,
 )
 check('the reasoning mapping can be switched off', mod.DEFAULT_CONFIG.mentionReasoning === true && mod.DEFAULT_CONFIG.fileDownload === true)
+
+/* --- 24. A Claw turn renders as one fold and one answer --- */
+// DSH draws each `reasoning` block as its own 「思考」 row; mirroring the ADP message
+// sequence turned one Claw turn into dozens of rows with the answer shredded between.
+/** The host's chunk invariant (`packages/llm/llm/src/invariant.ts`), restated. */
+function chunkProtocolErrors(chunks) {
+  const errors = []
+  const open = new Map()
+  const seen = new Set()
+  chunks.forEach((chunk, at) => {
+    if (chunk.type === 'block-start') {
+      if (seen.has(chunk.index)) errors.push(`#${at} restarts index ${chunk.index}`)
+      seen.add(chunk.index)
+      open.set(chunk.index, chunk.blockType)
+    } else if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
+      const expected = chunk.type === 'text-delta' ? 'text' : 'reasoning'
+      if (open.get(chunk.index) !== expected) errors.push(`#${at} ${chunk.type} on ${open.get(chunk.index) ?? 'closed'} ${chunk.index}`)
+    } else if (chunk.type === 'block-end') {
+      if (open.get(chunk.index) !== chunk.block?.type) errors.push(`#${at} ends ${chunk.index} as ${chunk.block?.type}`)
+      open.delete(chunk.index)
+    } else if (chunk.type === 'finish') {
+      if (at !== chunks.length - 1) errors.push('finish is not last')
+      if (open.size > 0) errors.push(`finish with open blocks ${[...open.keys()]}`)
+    }
+  })
+  if (chunks.at(-1)?.type !== 'finish') errors.push('no finish')
+  return errors
+}
+await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: 'session-claw', appId: APP_RUNNING, token: '客服助手' }))
+await preStep(mentionHarness, 'session-claw', [userOf('claw1', '@客服助手 CLAW')])
+const claw = await streamTurn(mentionHarness, 'session-claw')
+const clawEnds = claw.chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block)
+const clawFold = clawEnds.find(block => block.type === 'reasoning')?.text ?? ''
+const clawAnswer = clawEnds.find(block => block.type === 'text')?.text ?? ''
+const clawLive = claw.chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text).join('')
+check('the chunk stream satisfies the host invariant, blocks interleaved', chunkProtocolErrors(claw.chunks).length === 0, chunkProtocolErrors(claw.chunks).join('; '))
+check(
+  'a whole Claw turn is one 「思考」 fold followed by one answer',
+  clawEnds.map(block => block.type).join() === 'reasoning,text'
+    && claw.chunks.find(chunk => chunk.type === 'block-start')?.blockType === 'reasoning',
+  clawEnds.map(block => block.type).join(),
+)
+check(
+  'a raw tool invocation is summarised by its most descriptive argument',
+  clawFold.includes('- 🔧 **Agent** · 研究并生成大纲') && !clawFold.includes('"prompt"') && !clawFold.includes('工具执行'),
+  clawFold,
+)
+check('a failed tool is marked in the fold', clawFold.includes('- 🔧 **bash** · `python3 render.py` · ⚠️ 失败'), clawFold)
+check(
+  'sub-agent output stays in the fold, quoted under its task',
+  clawFold.includes('> **↳ 子智能体 · 研究并生成大纲**') && clawFold.includes('> SUBAGENT-REPORT')
+    && !clawAnswer.includes('SUBAGENT-REPORT') && !clawLive.includes('SUBAGENT-REPORT'),
+  clawFold,
+)
+check(
+  'progress narration streams live, then settles into the fold at its place',
+  clawLive.includes('首先加载 PPT 制作技能。') && !clawAnswer.includes('首先加载')
+    && clawFold.indexOf('💬 首先加载 PPT 制作技能。') > clawFold.indexOf('先加载技能。')
+    && clawFold.indexOf('💬 首先加载 PPT 制作技能。') < clawFold.indexOf('**Agent**'),
+  clawFold,
+)
+check(
+  'the fold opens with the thought itself, content.added text included',
+  clawFold.startsWith('用户要一份 PPT，先加载技能。'),
+  JSON.stringify(clawFold.slice(0, 40)),
+)
+check(
+  'a corrected and tail-less final reply is streamed whole, never doubled',
+  clawAnswer.startsWith('大纲已完成，请确认插图方案。') && clawLive.includes('大纲已完成，请确认插图方案。')
+    && !clawLive.includes('大纲已完成，大纲已完成'),
+  JSON.stringify(clawLive),
+)
+check(
+  'an unmeasured file is not labelled 0 B',
+  clawAnswer.includes('outline.md') && !clawAnswer.includes('0 B'),
+  clawAnswer,
+)
+check(
+  'tool summaries read the call, not its punctuation',
+  mod.toolSummary('Skill({"name": "powerpoint-pptx"})') === 'powerpoint-pptx'
+    && mod.toolSummary('TaskUpdate({"status": "completed", "taskId": "1"})') === '#1 已完成'
+    && mod.toolSummary('ls -la /workdir') === 'ls -la /workdir'
+    && mod.toolSummary('echo (x)') === 'echo (x)',
+)
+/* --- 25. Produced files become DSH's own deliverable cards --- */
+// DSH draws file cards from the durable `deliverables/presented` event (what its
+// `present` tool appends), listed in the turn tail when appended before the closing
+// assistant message. An assistant `file` block would render as a JSON dump instead.
+const appended = []
+const fakeSession = { id: 'session-cards', header: { cwd: workspace }, append: (type, data) => { appended.push({ type, data }); return { type, data, seq: appended.length } } }
+const cardFiles = [
+  { name: 'report.xlsx', url: 'https://agent.adp-cos.com/a/report.xlsx?sig=1', size: 20480, type: 'xlsx', localPath: 'adp-output/report.xlsx', bytes: 20480 },
+  { name: 'remote.md', url: 'https://sandbox.example.com/files?path=/workdir/remote.md', size: 0, type: 'md', error: '下载地址不在允许的 HTTPS 域名内' },
+]
+const carded = mod.presentTurnFiles({ session: fakeSession, turn: 3, files: cardFiles, source: 'clawagent_demo' })
+const presentedEvent = appended[0]
+check(
+  'a workspace copy is declared as a deliverable card, exactly in the present-tool shape',
+  appended.length === 1 && presentedEvent.type === 'deliverables/presented'
+    && presentedEvent.data.turn === 3 && typeof presentedEvent.data.callId === 'string' && presentedEvent.data.callId.startsWith('adp-')
+    && presentedEvent.data.files.length === 1 && presentedEvent.data.files[0].path === 'adp-output/report.xlsx'
+    && presentedEvent.data.files[0].description === '由 clawagent_demo 生成 · 20 KB'
+    && Object.keys(presentedEvent.data.files[0]).sort().join() === 'description,path'
+    && carded.length === 1 && carded[0].name === 'report.xlsx',
+  JSON.stringify(appended),
+)
+check(
+  'nothing is declared without a workspace copy, a turn, or an appendable Session',
+  mod.presentTurnFiles({ session: fakeSession, turn: 3, files: [cardFiles[1]] }).length === 0
+    && mod.presentTurnFiles({ session: fakeSession, turn: undefined, files: cardFiles }).length === 0
+    && mod.presentTurnFiles({ session: { header: {} }, turn: 3, files: cardFiles }).length === 0
+    && appended.length === 1,
+)
+check(
+  'a failing append leaves the files to the prose list instead of breaking the turn',
+  mod.presentTurnFiles({ session: { append: () => { throw new Error('closed') } }, turn: 3, files: cardFiles }).length === 0,
+)
+const proseAfterCards = mod.renderFiles(cardFiles.map(file => (file.localPath ? { ...file, presented: true } : file)))
+check(
+  'a carded file is not listed again in prose; the rest keep their link and reason',
+  !proseAfterCards.includes('report.xlsx') && proseAfterCards.includes('remote.md') && proseAfterCards.includes('未保存到工作区')
+    && mod.renderFiles([{ ...cardFiles[0], presented: true }]) === '',
+  proseAfterCards,
+)
+// Through the bridge: the pre-step records the owning Session and turn for the answer.
+await mentionHarness.call('POST', '/bind', JSON.stringify({ sessionId: 'session-cards', appId: APP_RUNNING, token: '客服助手' }))
+await mentionHarness.waterfall(
+  'agent/pre-step',
+  { agent: { session: fakeSession }, messages: [userOf('card1', '@客服助手 TIMELINE')], turn: 4, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [userOf('card1', '@客服助手 TIMELINE')] }),
+)
+const cardTurn = await streamTurn(mentionHarness, 'session-cards')
+const cardAnswer = cardTurn.chunks.filter(chunk => chunk.type === 'block-end' && chunk.block.type === 'text').map(chunk => chunk.block.text).join('')
+check(
+  'a file that could not be copied gets no card and stays in the prose list',
+  appended.length === 1 && cardAnswer.includes('**产出文件**') && cardAnswer.includes('out.txt'),
+  JSON.stringify({ appended: appended.length, tail: cardAnswer.slice(-120) }),
+)
+
+const quiet = mod.createMentionRenderer({ reasoning: false })
+quiet.push('message.added', { MessageId: 'q1', Message: { Type: 'thought' } })
+quiet.push('text.delta', { MessageId: 'q1', Text: '思考' })
+quiet.push('message.added', { MessageId: 'q2', Message: { Type: 'reply' } })
+quiet.push('text.delta', { MessageId: 'q2', Text: '回答' })
+check(
+  'with the fold switched off, only the answer streams',
+  quiet.drain().every(op => op.block === 'text') && quiet.finish().answer === '回答' && quiet.finish().reasoning === '',
+)
 
 gateway.close()
 

@@ -1132,10 +1132,16 @@ function createChatReducer(onEvent) {
       patch = { id, kind: entry.kind, name: entry.name, title: entry.title, tool: entry.tool, status: 'running' }
     } else if (name === 'content.added') {
       const content = payload?.Content
+      // The protocol lets a text content open with its first chunk
+      // (`{"Content":{"Type":"text","Text":"当前"}}`); it is the same text a `text.delta`
+      // would carry, so it takes that path and nothing is dropped.
+      if (content?.Type === 'text' && typeof content.Text === 'string' && content.Text !== '') {
+        return push('text.delta', { ...payload, Type: 'text.delta', Text: content.Text })
+      }
       if (content?.Type === 'file') {
         const id = keyOf(payload)
         const entry = upsert(id, {})
-        const file = { name: content.FileName ?? content.Name ?? '', url: content.FileUrl ?? content.Url ?? '' }
+        const file = fileInfoOf(content)
         if (!entry.files.some(existing => existing.url === file.url)) entry.files.push(file)
         patch = { id, files: entry.files }
       }
@@ -1183,8 +1189,13 @@ function createChatReducer(onEvent) {
       const entry = upsert(id, { status: 'done' })
       if (typeof message?.Title === 'string' && message.Title !== '') entry.title = message.Title
       patch = { id, status: 'done', title: entry.title }
+      // Each message carries only its own files and forms, so they accumulate; a turn
+      // that never completes would otherwise keep only the last message's.
       const found = extractInteractions(payload?.Message)
-      if (found.length > 0) interactions = found
+      if (found.length > 0) {
+        const seen = new Set(interactions.map(item => JSON.stringify(item)))
+        interactions = [...interactions, ...found.filter(item => !seen.has(JSON.stringify(item)))]
+      }
     } else if (name === 'response.completed') {
       // The completed response restates every message, so it is authoritative: rebuild
       // the timeline from it instead of trusting the incremental stream.
@@ -1655,6 +1666,63 @@ async function saveState(path, state) {
   await chmod(path, 0o600).catch(() => {})
 }
 
+/** Printable ASCII without space: the charset DSH accepts for an API key. */
+const LEGAL_SECRET = /^[\x21-\x7E]+$/u
+
+/**
+ * Apply one settings-form submission to the panel-saved credentials.
+ *
+ * The rules the form promises the user:
+ * - the secrets are write-only: an empty (or absent) SecretId / SecretKey means **keep
+ *   what is saved** — the form never receives them back, so treating '' as "delete"
+ *   wiped a working key pair every time the settings were saved a second time;
+ * - replacing the key means sending both halves: a SecretId belongs to exactly one
+ *   SecretKey, so one new half with an old other half is never a valid pair;
+ * - region / space: '' falls back to the plugin config default;
+ * - `clear` removes the saved key pair only; region, space and site are preferences.
+ * Nothing is mutated: the caller commits the result after validation succeeds.
+ * @param current - the saved panel credentials.
+ * @param body - the POST /config body.
+ * @returns the next panel credentials.
+ */
+export function applyCredentialForm(current, body) {
+  const next = { ...(current ?? {}) }
+  const form = body !== null && typeof body === 'object' ? body : {}
+  if (form.clear === true) {
+    delete next.secretId
+    delete next.secretKey
+    return next
+  }
+  if (form.site !== undefined) {
+    // '' / null: drop the panel's choice and follow the plugin config again.
+    if (form.site === '' || form.site === null) delete next.site
+    else if (typeof form.site !== 'string' || !Object.hasOwn(SITES, form.site)) {
+      throw new AdpError(`未知站点 ${String(form.site)}`, { code: 'InvalidArgs' })
+    } else next.site = form.site
+  }
+  for (const field of ['region', 'spaceId']) {
+    if (typeof form[field] !== 'string') continue
+    const value = form[field].trim()
+    if (value === '') delete next[field]
+    else next[field] = value
+  }
+  const secretId = typeof form.secretId === 'string' ? form.secretId.trim() : ''
+  const secretKey = typeof form.secretKey === 'string' ? form.secretKey.trim() : ''
+  if ((secretId === '') !== (secretKey === '')) {
+    throw new AdpError('更换密钥时 SecretId 和 SecretKey 必须同时填写；两项都留空则保留已保存的密钥。', { code: 'InvalidArgs' })
+  }
+  if (secretId !== '') {
+    // DSH's own key rule (`normalizeApiKey`): printable ASCII, no space — which also
+    // refuses a pasted `NAME=value` line's quotes and a wrapped paste.
+    if (!LEGAL_SECRET.test(secretId) || !LEGAL_SECRET.test(secretKey)) {
+      throw new AdpError('SecretId / SecretKey 格式不正确，请检查是否粘贴了多余内容。', { code: 'InvalidArgs' })
+    }
+    next.secretId = secretId
+    next.secretKey = secretKey
+  }
+  return next
+}
+
 /** Show only the ends of a secret so the panel can confirm which key is in use. */
 function maskSecret(value) {
   if (typeof value !== 'string' || value === '') return ''
@@ -1825,7 +1893,7 @@ export function messageTextOf(message) {
  * @param interactions - normalised descriptors from {@link extractInteractions}.
  * @returns Markdown for the assistant message, or '' when there is nothing to render.
  */
-export function renderInteractions(interactions) {
+export function renderInteractions(interactions, fileOptions) {
   const list = Array.isArray(interactions) ? interactions : []
   const sections = []
   const files = []
@@ -1849,7 +1917,7 @@ export function renderInteractions(interactions) {
       references.push(...(Array.isArray(item.references) ? item.references : []))
     }
   }
-  const fileSection = renderFiles(files)
+  const fileSection = renderFiles(files, fileOptions)
   if (fileSection !== '') sections.push(fileSection)
   const referenceSection = renderReferences(references)
   if (referenceSection !== '') sections.push(referenceSection)
@@ -1902,42 +1970,56 @@ function isInlineImage(file) {
 }
 
 /**
- * Render produced files as DSH-native Markdown.
+ * Render produced files with DSH's own Markdown affordances.
  *
- * A file copied into the workspace (`localPath`) becomes a relative link, which DSH
- * turns into a click-to-preview action in the sidebar (HTML, Office, PDF, code, images)
- * once the message completes; an image is also shown inline. A file that could not be
- * copied keeps its original download link and says why.
- * @param files - `{ name, url, size, type, localPath?, error? }` descriptors.
- * @returns a 「产出文件」 section, or '' when there are no files.
+ * - A copied image is shown inline from the workspace (`![…](adp-output/x.png)`): DSH
+ *   renders it as its native message image with click-to-enlarge, so it is not listed
+ *   again unless it has no card. A remote image is inlined only from a known public
+ *   host — a sandbox URL needs a token and would only say 「图片无法预览」.
+ * - A file that received a deliverable card (`presented`) is not listed in prose.
+ * - Every other file is one line whose link DSH decorates itself: a workspace path
+ *   becomes its file button (type icon, click-to-preview), a remote URL its external
+ *   link. No emoji in front — it doubled the native icon — and no size ADP never
+ *   measured (`FileSize: "0"`).
+ * @param files - `{ name, url, size, type, localPath?, bytes?, error?, presented? }`.
+ * @param options - `{ inlineHosts, skipImages }`: public image hosts; workspace
+ *   images the answer already shows inline.
+ * @returns a 「产出文件」 section, or '' when there is nothing to add.
  */
-export function renderFiles(files) {
+export function renderFiles(files, options = {}) {
+  const inlineHosts = Array.isArray(options.inlineHosts) ? options.inlineHosts : []
+  const skipImages = options.skipImages instanceof Set ? options.skipImages : new Set()
   const list = Array.isArray(files) ? files.filter(file => file !== null && typeof file === 'object') : []
-  if (list.length === 0) return ''
-  const lines = ['**产出文件**']
+  const images = []
+  const lines = []
   for (const file of list) {
-    const label = markdownLabel(file.name || (file.localPath ? file.localPath.split('/').pop() : '') || '产出文件')
-    const size = formatBytes(file.bytes ?? file.size)
-    const meta = [size, typeof file.type === 'string' && file.type !== '' && file.type.length <= 40 ? file.type : '']
-      .filter(Boolean).join(' · ')
+    const local = typeof file.localPath === 'string' && file.localPath !== '' ? file.localPath : ''
+    const label = markdownLabel(file.name || (local ? local.split('/').pop() : '') || '产出文件')
+    const image = isInlineImage(file)
+    if (local !== '' && image && !skipImages.has(local)) images.push(`![${label}](${markdownPath(local)})`)
+    if (file.presented === true || (local !== '' && image)) continue
+    const reported = file.bytes ?? file.size
+    const size = reported === 0 && local === '' ? '' : formatBytes(reported)
+    const type = typeof file.type === 'string' && file.type !== '' && file.type.length <= 12 ? file.type.toUpperCase() : ''
+    const meta = [type, size].filter(Boolean).join(' · ')
     const suffix = meta === '' ? '' : ` · ${meta}`
-    if (typeof file.localPath === 'string' && file.localPath !== '') {
-      const target = markdownPath(file.localPath)
-      if (isInlineImage(file)) lines.push('', `![${label}](${target})`, '')
-      const remote = markdownUrl(file.url)
-      lines.push(`- 📄 [${label}](${target})${suffix}${remote === '' ? '' : ` · [原始下载](${remote})`}`)
+    if (local !== '') {
+      lines.push(`- [${label}](${markdownPath(local)})${suffix}`)
       continue
     }
     const remote = markdownUrl(file.url)
     if (remote === '') {
-      lines.push(`- 📄 ${label}${suffix}（ADP 没有返回可下载的地址）`)
+      lines.push(`- ${label}${suffix} · *ADP 没有返回可下载的地址*`)
       continue
     }
-    if (isInlineImage(file)) lines.push('', `![${label}](${remote})`, '')
-    const reason = typeof file.error === 'string' && file.error !== '' ? `（未保存到工作区：${file.error}）` : ''
-    lines.push(`- 📄 [${label}](${remote})${suffix}${reason}`)
+    if (image && isAllowedDownloadUrl(file.url, inlineHosts)) images.push(`![${label}](${remote})`)
+    const reason = typeof file.error === 'string' && file.error !== '' ? ` · *未保存到工作区：${file.error}*` : ''
+    lines.push(`- [${label}](${remote})${suffix}${reason}`)
   }
-  return lines.join('\n')
+  const sections = []
+  if (images.length > 0) sections.push(images.join('\n\n'))
+  if (lines.length > 0) sections.push(['**产出文件**', ...lines].join('\n'))
+  return sections.join('\n\n')
 }
 
 /**
@@ -1959,14 +2041,51 @@ export function renderReferences(references) {
   return lines.length === 0 ? '' : ['**参考来源**', ...lines].join('\n')
 }
 
-/** The comparison key of a remote file URL: signatures and query strings rotate. */
+/** Query parameters that identify a file (sandbox `/files?path=…`), unlike signatures. */
+const FILE_IDENTITY_PARAMS = ['path', 'file', 'filename', 'key', 'id']
+
+/**
+ * The comparison key of a remote file URL. Signatures and expiry rotate, so the query
+ * is ignored — except the parameters that name the file: every Claw sandbox file is
+ * `https://sandbox…/files?path=/workdir/x`, and keying on the path alone collapsed a
+ * turn's files into one.
+ */
 function fileUrlKey(url) {
   try {
     const parsed = new URL(url)
-    return `${parsed.origin}${parsed.pathname}`
+    const identity = FILE_IDENTITY_PARAMS
+      .filter(name => parsed.searchParams.has(name))
+      .map(name => `${name}=${parsed.searchParams.get(name)}`)
+    return `${parsed.origin}${parsed.pathname}${identity.length === 0 ? '' : `?${identity.join('&')}`}`
   } catch {
     return ''
   }
+}
+
+/**
+ * Turn inline images of the turn's files that the browser cannot load into plain links.
+ *
+ * DSH renders `![…](https://…)` straight from the URL; a Claw sandbox file needs a
+ * directory token, so it only ever showed 「图片无法预览」. An image whose file was not
+ * copied and is not on a known public host is demoted to a link (DSH's native external
+ * link, which opens in the Sidebar browser); other images are left alone.
+ * @param text - Markdown answer text.
+ * @param files - the turn's file descriptors (`url`, `localPath?`).
+ * @param hosts - host suffixes known to serve public, loadable files.
+ * @returns the text with unloadable images demoted.
+ */
+export function demoteUnloadableImages(text, files, hosts) {
+  if (typeof text !== 'string' || text === '') return text
+  const blocked = new Set()
+  for (const file of Array.isArray(files) ? files : []) {
+    if (typeof file?.localPath === 'string' && file.localPath !== '') continue
+    if (typeof file?.url !== 'string' || isAllowedDownloadUrl(file.url, hosts)) continue
+    const key = fileUrlKey(file.url)
+    if (key !== '') blocked.add(key)
+  }
+  if (blocked.size === 0) return text
+  return text.replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/gu, (match, alt, url) =>
+    (blocked.has(fileUrlKey(url)) ? `[${alt || '图片'}](${url})` : match))
 }
 
 /**
@@ -1992,6 +2111,370 @@ export function rewriteFileLinks(text, files) {
     const target = local.get(fileUrlKey(url))
     return target === undefined ? match : `](${target})`
   })
+}
+
+/* ------------------------------------------------------------------ *
+ * `@` bridge: produced files as DSH deliverable cards
+ * ------------------------------------------------------------------ */
+
+/** Upper bound of the host's delivery card list for one declaration. */
+const PRESENT_MAX_FILES = 8
+
+/**
+ * Declare the workspace copies of a turn's files the way DSH's own `present` tool
+ * does, so the session page renders them as its native file cards
+ * (`PresentedFileCard`: type icon, name, description, click-to-preview in the right
+ * Sidebar, open locally / reveal in the file manager).
+ *
+ * The cards come from the durable `deliverables/presented` event, not from the
+ * message: an assistant `file` block would render as an unknown-block JSON dump, and
+ * the turn tail only lists declarations appended **before** the turn's closing
+ * `assistant/message` — which is why this runs inside the `llm/stream` answer, before
+ * its final chunks. Only files already copied into the workspace qualify; the card's
+ * actions resolve paths inside the workspace root and cannot open a remote URL.
+ * @param options - `{ session, turn, files, source }`: the Session (needs `append`),
+ *   the 1-based turn from `agent/pre-step`, file descriptors with `localPath`, and the
+ *   app name for the card description.
+ * @returns the descriptors that received a card (empty when nothing was declared).
+ */
+export function presentTurnFiles(options) {
+  const { session, turn, files, source } = options ?? {}
+  if (typeof session?.append !== 'function' || !Number.isSafeInteger(turn) || turn < 1) return []
+  const local = (Array.isArray(files) ? files : [])
+    .filter(file => typeof file?.localPath === 'string' && file.localPath.trim() !== '')
+    .slice(0, PRESENT_MAX_FILES)
+  if (local.length === 0) return []
+  const origin = typeof source === 'string' && source.trim() !== '' ? `由 ${source.trim()} 生成` : '由 ADP 智能体生成'
+  const declared = local.map((file) => {
+    const size = formatBytes(file.bytes ?? file.size)
+    return { path: file.localPath, description: size === '' ? origin : `${origin} · ${size}` }
+  })
+  try {
+    // A synthetic id: the event only needs a non-empty call id, and no tool call of
+    // the model may be claimed for a card the model never asked for.
+    session.append('deliverables/presented', { turn, callId: `adp-${randomUUID()}`, files: declared })
+  } catch (error) {
+    console.error(`[adp-console] 无法登记产出文件卡片：${error instanceof Error ? error.message : String(error)}`)
+    return []
+  }
+  return local
+}
+
+/* ------------------------------------------------------------------ *
+ * `@` bridge: one ADP turn as two DSH blocks
+ * ------------------------------------------------------------------ */
+
+/** Tool-call arguments worth showing, most descriptive first. */
+const TOOL_SUMMARY_KEYS = ['description', 'subject', 'query', 'command', 'prompt', 'file_path', 'path', 'url', 'pattern', 'name', 'activeForm']
+const TASK_STATUS_LABEL = { completed: '已完成', in_progress: '进行中', pending: '待开始', deleted: '已删除' }
+/** Titles ADP puts on a tool message before (or instead of) the concrete invocation. */
+const GENERIC_TOOL_TITLES = new Set(['工具执行', '工具调用', '调用工具', 'tool', 'Tool', 'tool_call'])
+/** Tools whose summary is a command line, shown as inline code. */
+const COMMAND_TOOLS = /^(?:bash|shell|sh|zsh|exec|execute|terminal|run|python|command)\b/iu
+const THOUGHT_LIMIT = 2000
+const NARRATION_LIMIT = 1500
+const SUBREPLY_LIMIT = 1200
+
+/** Collapse whitespace and cap the length of a one-line summary. */
+function oneLine(text, max) {
+  const flat = String(text ?? '').replace(/\s+/gu, ' ').trim()
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
+}
+
+/**
+ * A readable summary of a tool invocation.
+ *
+ * A Claw tool `Title` is the raw call — `Agent({"description":"…","prompt":"<2 KB>"})`,
+ * `TaskUpdate({"status":"completed","taskId":"1"})` — so the arguments are parsed and
+ * the most descriptive one is surfaced; a plain title (a command line, a query) is kept.
+ * @param title - the tool message's concrete `Title`.
+ * @param max - maximum summary length.
+ * @returns a single line, or '' when there is nothing to show.
+ */
+export function toolSummary(title, max = 90) {
+  if (typeof title !== 'string') return ''
+  const source = title.trim()
+  if (source === '') return ''
+  const call = /^[\w.:/-]+\(([\s\S]*)\)$/u.exec(source)
+  if (call === null) return oneLine(source, max)
+  let args
+  try {
+    args = JSON.parse(call[1])
+  } catch {
+    return oneLine(call[1], max)
+  }
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return oneLine(String(args ?? ''), max)
+  const task = args.taskId ?? args.task_id
+  if ((typeof task === 'string' || typeof task === 'number') && typeof args.status === 'string') {
+    return oneLine(`#${task} ${TASK_STATUS_LABEL[args.status] ?? args.status}`, max)
+  }
+  for (const key of TOOL_SUMMARY_KEYS) {
+    const value = args[key]
+    if (typeof value === 'string' && value.trim() !== '') return oneLine(value, max)
+  }
+  const first = Object.values(args).find(value => typeof value === 'string' && value.trim() !== '')
+  return typeof first === 'string' ? oneLine(first, max) : ''
+}
+
+/** Cap a folded paragraph; the fold is a trace, not an archive. */
+function capped(text, limit) {
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+/** Prefix every line as a blockquote; prefix-stable as the text grows. */
+function quoteLines(text) {
+  return text.split('\n').map(line => (line === '' ? '>' : `> ${line}`)).join('\n')
+}
+
+/**
+ * Map one ADP turn (the HTTP SSE / WebSocket event vocabulary) onto the two blocks the
+ * DSH session page renders: a folded 「思考」 `reasoning` block for the process and a
+ * `text` block for the answer.
+ *
+ * DSH draws every `reasoning` block as its own 「思考」 row, so following the ADP message
+ * sequence block for block turned one Claw turn into 30–70 alternating rows with the
+ * answer shredded between them. Here the whole process lives in **one** fold, opened
+ * once and interleaved with the answer by block index (the chunk protocol allows
+ * concurrent blocks, and `block-end` is authoritative):
+ *
+ * - `thought` → a paragraph of the fold; `tool_call` → one list line, its raw
+ *   invocation summarised (`🔧 **Agent** · 研究并生成大纲`), failures marked;
+ * - sub-agent messages (`ExtraInfo.IsSubAgent` / `ParentMessageId`) → a quoted section
+ *   of the fold under `↳ 子智能体`, never the answer;
+ * - top-level `reply` messages stream live into the answer. A reply that a later step
+ *   followed was progress narration (「继续搜索…」): at completion it moves into the
+ *   fold at its place (`💬 …`) and the answer keeps the final reply only. A turn that
+ *   ends without a final reply keeps its narration visible.
+ *
+ * `text.replace` and the `message.done` / `response.completed` restatements are applied
+ * per `ContentIndex`, so a corrected or tail-less stream settles on the full text.
+ * @param options - `{ reasoning }`: false keeps every reply in the answer and no fold.
+ * @returns `{ push(name, payload), drain(), finish() }`: `drain` yields live
+ *   `{ block: 'reasoning'|'text', text }` appends; `finish` the authoritative texts.
+ */
+export function createMentionRenderer(options = {}) {
+  const reasoning = options.reasoning !== false
+  const messages = new Map()
+  const order = []
+  const ops = []
+  let lastId
+  /** The fold item streamed last and what of it was emitted. */
+  let live = { key: null, item: null, body: '' }
+  /** The answer reply streamed last; replies already started are never restarted. */
+  let answerTail = { id: null, text: '' }
+  const answerStarted = new Set()
+
+  const filled = value => typeof value === 'string' && value !== ''
+  const idOf = payload => (filled(payload?.MessageId) ? payload.MessageId
+    : filled(payload?.Message?.MessageId) ? payload.Message.MessageId : undefined)
+
+  const note = (id, message, payload, event) => {
+    let m = messages.get(id)
+    if (m === undefined) {
+      m = { id, type: '', sub: false, parent: '', agent: '', name: '', title: '', tool: '', status: 'processing', contents: [], lastIndex: 0 }
+      messages.set(id, m)
+      order.push(id)
+    }
+    const type = message?.Type ?? payload?.MessageType
+    if (filled(type)) m.type = type
+    const extra = message?.ExtraInfo
+    if (extra !== null && typeof extra === 'object') {
+      if (extra.IsSubAgent === true || (extra.IsSubAgent === undefined && filled(extra.ParentMessageId))) m.sub = true
+      if (filled(extra.ParentMessageId)) m.parent = extra.ParentMessageId
+      if (filled(extra.AgentName)) m.agent = extra.AgentName
+      if (filled(extra.ToolName)) m.tool = extra.ToolName
+    }
+    if (filled(message?.Name)) m.name = message.Name
+    const title = message?.Title
+    if (filled(title)) {
+      // A tool's concrete invocation arrives on `message.processing`; the added / done /
+      // completed frames may restate a generic 「工具执行」 that must not replace it.
+      if (m.type !== 'tool_call') m.title = title
+      else if (event === 'message.processing') { m.title = title; m.concrete = true }
+      else if (!m.concrete && !GENERIC_TOOL_TITLES.has(title) && title !== m.name) { m.title = title; m.concrete = true }
+    }
+    if (filled(message?.Status)) m.status = message.Status
+    return m
+  }
+  const setText = (m, index, text, replace) => {
+    const at = Number.isInteger(index) && index >= 0 ? index : m.lastIndex
+    m.lastIndex = at
+    while (m.contents.length <= at) m.contents.push('')
+    m.contents[at] = replace ? text : m.contents[at] + text
+  }
+  /** A restated message (`message.done`, `response.completed`) is the full text. */
+  const absorb = (m, message) => {
+    if (m.type === 'tool_call') return
+    const contents = Array.isArray(message?.Contents) ? message.Contents : []
+    const texts = contents.map(content => (content?.Type === 'text' && typeof content.Text === 'string' ? content.Text : ''))
+    if (texts.some(filled)) m.contents = texts
+  }
+  const textOf = m => m.contents.join('').trim()
+
+  const IGNORED = new Set(['question', 'recommendation'])
+  const isReply = m => m.type === 'reply' || m.type === ''
+  const isAnswer = m => isReply(m) && !m.sub
+  const kindOf = m => (m.type === 'tool_call' ? 'tool' : isReply(m) ? 'subreply' : 'thought')
+
+  const toolLine = (m) => {
+    const tool = m.tool || m.name || '工具'
+    const summary = toolSummary(m.title)
+    let detail = ''
+    if (summary !== '') {
+      detail = COMMAND_TOOLS.test(tool) && !summary.includes('`') ? ` · \`${summary}\`` : ` · ${markdownLabel(summary)}`
+    }
+    const mark = m.status === 'failed' ? ' · ⚠️ 失败' : m.status === 'stop' ? ' · 已停止' : ''
+    return `- 🔧 **${markdownLabel(tool)}**${detail}${mark}`
+  }
+  const renderItem = (item) => {
+    let body = ''
+    if (item.kind === 'header') {
+      body = `**↳ 子智能体${item.label ? ` · ${markdownLabel(item.label)}` : ''}**`
+    } else if (item.kind === 'tool') {
+      body = item.m.concrete || item.m.status !== 'processing' ? toolLine(item.m) : ''
+    } else {
+      const text = textOf(item.m)
+      if (text !== '') {
+        if (item.kind === 'narration') body = `💬 ${capped(text, NARRATION_LIMIT)}`
+        else body = capped(text, item.kind === 'subreply' ? SUBREPLY_LIMIT : THOUGHT_LIMIT)
+      }
+    }
+    return item.quoted && body !== '' ? quoteLines(body) : body
+  }
+  const joiner = (a, b) => {
+    const tools = a.kind === 'tool' && b.kind === 'tool'
+    if (a.quoted && b.quoted) return tools ? '\n' : '\n>\n'
+    return tools && !a.quoted && !b.quoted ? '\n' : '\n\n'
+  }
+  /** The fold's items in protocol order; `narration` places moved replies. */
+  const processItems = (narration) => {
+    const items = []
+    let group = null
+    for (const id of order) {
+      const m = messages.get(id)
+      if (isAnswer(m)) {
+        group = null
+        if (narration?.has(id)) items.push({ key: `n:${id}`, kind: 'narration', m, quoted: false })
+        continue
+      }
+      if (IGNORED.has(m.type)) continue
+      if (m.sub) {
+        const g = m.parent || m.agent || 'sub'
+        if (g !== group) {
+          const parent = messages.get(m.parent)
+          items.push({ key: `h:${id}`, kind: 'header', label: m.agent || (parent ? toolSummary(parent.title, 40) : ''), quoted: true })
+          group = g
+        }
+      } else {
+        group = null
+      }
+      items.push({ key: `m:${id}`, kind: kindOf(m), m, quoted: m.sub })
+    }
+    return items
+  }
+  const renderProcess = (items) => {
+    let out = ''
+    let previous = null
+    for (const item of items) {
+      const body = renderItem(item)
+      if (body === '') continue
+      out += (previous === null ? '' : joiner(previous, item)) + body
+      previous = item
+    }
+    return out
+  }
+
+  /** Stream the fold append-only: the item in flight grows, new items follow it. */
+  const syncReasoning = () => {
+    if (!reasoning) return
+    const items = processItems(null)
+    const at = live.key === null ? -1 : items.findIndex(item => item.key === live.key)
+    if (live.key !== null && at < 0) return
+    if (at >= 0) {
+      const body = renderItem(items[at])
+      if (body.length > live.body.length && body.startsWith(live.body)) {
+        ops.push({ block: 'reasoning', text: body.slice(live.body.length) })
+        live.body = body
+      }
+    }
+    for (let i = at + 1; i < items.length; i += 1) {
+      const body = renderItem(items[i])
+      if (body === '') continue
+      ops.push({ block: 'reasoning', text: (live.item === null ? '' : joiner(live.item, items[i])) + body })
+      live = { key: items[i].key, item: items[i], body }
+    }
+  }
+  /** Stream a top-level reply into the answer, append-only. */
+  const syncAnswer = (id) => {
+    const m = messages.get(id)
+    if (m === undefined || !isAnswer(m)) return
+    const text = textOf(m)
+    if (text === '') return
+    if (answerTail.id === id) {
+      if (text.length > answerTail.text.length && text.startsWith(answerTail.text)) {
+        ops.push({ block: 'text', text: text.slice(answerTail.text.length) })
+        answerTail.text = text
+      }
+      return
+    }
+    if (answerStarted.has(id)) return
+    ops.push({ block: 'text', text: (answerStarted.size === 0 ? '' : '\n\n') + text })
+    answerStarted.add(id)
+    answerTail = { id, text }
+  }
+
+  const push = (name, payload) => {
+    if (typeof name !== 'string' || name.startsWith('entry.') || payload === null || typeof payload !== 'object') return
+    if (name === 'message.added' || name === 'message.processing' || name === 'message.done') {
+      const id = idOf(payload) ?? lastId
+      if (id === undefined) return
+      const m = note(id, payload.Message, payload, name)
+      if (name === 'message.done') absorb(m, payload.Message)
+      lastId = id
+      syncReasoning()
+      syncAnswer(id)
+    } else if (name === 'text.delta' || name === 'text.replace') {
+      const id = idOf(payload) ?? lastId ?? 'anon'
+      const m = note(id, undefined, payload, name)
+      setText(m, payload.ContentIndex, extractDeltaText(payload), name === 'text.replace')
+      lastId = id
+      syncReasoning()
+      syncAnswer(id)
+    } else if (name === 'response.completed') {
+      const record = payload.Response
+      for (const message of Array.isArray(record?.Messages) ? record.Messages : []) {
+        if (!filled(message?.MessageId)) continue
+        absorb(note(message.MessageId, message, undefined, name), message)
+      }
+      syncReasoning()
+      for (const id of order) syncAnswer(id)
+    }
+  }
+
+  const finish = () => {
+    const replies = order.map(id => messages.get(id)).filter(isAnswer)
+      .map(m => ({ id: m.id, text: textOf(m) })).filter(reply => reply.text !== '')
+    const narration = new Set()
+    if (reasoning) {
+      let stepAfter = false
+      for (let i = order.length - 1; i >= 0; i -= 1) {
+        const m = messages.get(order[i])
+        if (isAnswer(m)) {
+          if (stepAfter && textOf(m) !== '') narration.add(m.id)
+        } else if (!IGNORED.has(m.type) && renderItem({ kind: kindOf(m), m, quoted: false }) !== '') {
+          stepAfter = true
+        }
+      }
+    }
+    const finals = replies.filter(reply => !narration.has(reply.id))
+    const moved = narration.size > 0 && finals.length > 0
+    return {
+      answer: (moved ? finals : replies).map(reply => reply.text).join('\n\n'),
+      reasoning: reasoning ? renderProcess(processItems(moved ? narration : null)) : '',
+    }
+  }
+
+  return { push, drain: () => ops.splice(0), finish }
 }
 
 /* ------------------------------------------------------------------ *
@@ -2321,6 +2804,18 @@ export function apply(ctx, config) {
       chatTimeoutMs: settings.chatTimeoutMs,
       statePath,
       chatEndpointHost: safeHost(credentials.chatEndpoint),
+      // What each preference falls back to, and whether the panel overrides it: the
+      // form shows 「已覆盖 / 恢复默认」 exactly as DSH's settings fields do.
+      defaults: {
+        region: settings.region,
+        spaceId: settings.spaceId,
+        site: Object.hasOwn(SITES, settings.site) ? settings.site : 'cn',
+      },
+      overrides: {
+        region: state.credentials.region ?? null,
+        spaceId: state.credentials.spaceId ?? null,
+        site: state.credentials.site ?? null,
+      },
     }
   }
 
@@ -2627,7 +3122,7 @@ export function apply(ctx, config) {
    * with one app stays a conversation.
    * @returns always undefined; the claimed messages are never rewritten.
    */
-  async function claimMention(agent, messages, signal) {
+  async function claimMention(agent, messages, signal, turn) {
     if (!Array.isArray(messages) || messages.length === 0) return undefined
     let claim
     for (const message of messages) {
@@ -2651,6 +3146,10 @@ export function apply(ctx, config) {
         appId: bound.appId,
         name: bound.name,
         body: resolved === undefined ? claim.text : removeMentionToken(claim.text, resolved.name),
+        // The Session and turn the answer belongs to: produced files are declared on
+        // this Session as this turn's deliverable cards.
+        session: agent.session,
+        turn: Number.isSafeInteger(turn) ? turn : undefined,
       })
     }
     return undefined
@@ -2664,55 +3163,21 @@ export function apply(ctx, config) {
    * the ADP answer into an ordinary assistant message. Nothing is thrown at the loop —
    * an ADP failure becomes visible text plus a terminal chunk, so a broken app answers
    * in the conversation instead of blanking the turn.
+   *
+   * The turn is at most two blocks — one folded `reasoning` for the process and one
+   * `text` for the answer — streamed concurrently by index (see
+   * {@link createMentionRenderer}); each `block-end` carries the settled text.
    */
   async function* streamMentionReply(sessionId, route, signal, session) {
-    /**
-     * Parts the reducer produced but this generator has not yielded yet, each tagged with
-     * the DSH block it belongs to: an ADP `reply` streams as `text`, a `thought` and a
-     * `tool_call` stream as the folded `reasoning` block (思考过程).
-     */
-    const queue = []
-    /** entry id → normalised kind / display fields, learned from the timeline patches. */
-    const entryKinds = new Map()
-    const entryLabels = new Map()
-    const announcedTools = new Set()
-    let lastReasoningId
-    const pushPart = (kind, text) => {
-      if (text === '') return
-      queue.push({ kind, text })
-      wake?.()
-      wake = undefined
-    }
-    const reasoningFrom = (name, patch) => {
-      if (settings.mentionReasoning === false || patch === null || typeof patch !== 'object') return
-      // `entry.*` replays the completed record; everything in it already streamed.
-      if (name.startsWith('entry.')) return
-      const id = patch.id
-      if (typeof patch.kind === 'string') entryKinds.set(id, patch.kind)
-      if (patch.tool || patch.name) {
-        entryLabels.set(id, { tool: patch.tool || entryLabels.get(id)?.tool || '', name: patch.name || entryLabels.get(id)?.name || '' })
-      }
-      const kind = entryKinds.get(id)
-      const separator = lastReasoningId !== undefined && lastReasoningId !== id ? '\n\n' : ''
-      if (kind === 'reasoning' && name === 'text.delta' && typeof patch.append === 'string' && patch.append !== '') {
-        pushPart('reasoning', separator + patch.append)
-        lastReasoningId = id
-        return
-      }
-      if (kind === 'tool' && !announcedTools.has(id)) {
-        const title = typeof patch.title === 'string' ? patch.title.trim() : ''
-        if (title === '' && patch.status !== 'done') return
-        const label = entryLabels.get(id)
-        const tool = label?.tool || label?.name || '工具'
-        announcedTools.add(id)
-        pushPart('reasoning', `${lastReasoningId === undefined ? '' : '\n\n'}🔧 ${tool}${title === '' ? '' : `：${title.slice(0, 200)}`}`)
-        lastReasoningId = id
-      }
-    }
+    const renderer = createMentionRenderer({ reasoning: settings.mentionReasoning !== false })
     let wake
     let finished = false
     let failure
     let result
+    const notify = () => {
+      wake?.()
+      wake = undefined
+    }
     const controller = new AbortController()
     const onAbort = () => controller.abort(signal?.reason)
     if (signal?.aborted === true) onAbort()
@@ -2736,9 +3201,9 @@ export function apply(ctx, config) {
           conversationId: mentionConversations.get(conversationKey),
           userId,
           signal: controller.signal,
-          onEvent: (name, _payload, delta, patch) => {
-            if (delta) pushPart('text', delta)
-            reasoningFrom(String(name ?? ''), patch)
+          onEvent: (name, payload) => {
+            renderer.push(String(name ?? ''), payload)
+            notify()
           },
           openConversation: async () => {
             const created = await createApiConversation(credentials, route.appId, appKey, userId, controller.signal)
@@ -2751,43 +3216,39 @@ export function apply(ctx, config) {
         failure = error
       } finally {
         finished = true
-        wake?.()
-        wake = undefined
+        notify()
       }
     })()
 
-    /** The block currently open on the DSH stream, `{ index, type, text }`, or null. */
-    let open = null
+    /** Open blocks by kind, and their start order (which is also the close order). */
+    const blocks = new Map()
+    const started = []
     let nextIndex = 0
-    let textBlocks = 0
-    /** Every answer part streamed so far, to reconcile with the authoritative completion. */
-    let streamedAnswer = ''
-    const closeOpen = function* (finalText) {
-      if (open === null) return
-      const text = finalText ?? open.text
-      yield { type: 'block-end', index: open.index, block: { type: open.type, text } }
-      open = null
-    }
-    const emit = function* (kind, text) {
-      if (open === null || open.type !== kind) {
-        yield* closeOpen()
-        open = { index: nextIndex, type: kind, text: '' }
+    const deliver = function* (kind, text) {
+      if (text === '') return
+      let block = blocks.get(kind)
+      if (block === undefined) {
+        block = { index: nextIndex, kind, text: '' }
         nextIndex += 1
-        if (kind === 'text') textBlocks += 1
-        yield { type: 'block-start', index: open.index, blockType: kind }
+        blocks.set(kind, block)
+        started.push(block)
+        yield { type: 'block-start', index: block.index, blockType: kind }
       }
-      // A paragraph break when the answer resumes after a folded reasoning block.
-      const chunk = kind === 'text' && open.text === '' && streamedAnswer !== '' ? text.replace(/^\n+/u, '') : text
-      open.text += chunk
-      if (kind === 'text') streamedAnswer += chunk
-      yield { type: kind === 'text' ? 'text-delta' : 'reasoning-delta', index: open.index, text: chunk }
+      block.text += text
+      yield { type: kind === 'text' ? 'text-delta' : 'reasoning-delta', index: block.index, text }
+    }
+    const closeAll = function* (settled) {
+      for (const block of started) {
+        const text = typeof settled[block.kind] === 'string' && settled[block.kind] !== '' ? settled[block.kind] : block.text
+        yield { type: 'block-end', index: block.index, block: { type: block.kind, text } }
+      }
     }
 
     try {
       for (;;) {
-        if (queue.length > 0) {
-          const part = queue.shift()
-          yield* emit(part.kind, part.text)
+        const ops = renderer.drain()
+        if (ops.length > 0) {
+          for (const op of ops) yield* deliver(op.block, op.text)
           continue
         }
         if (finished) break
@@ -2799,51 +3260,58 @@ export function apply(ctx, config) {
       if (!finished) controller.abort(new Error('@ 会话被取消'))
     }
     await chat
+    for (const op of renderer.drain()) yield* deliver(op.block, op.text)
 
-    // The completion frame restates the whole answer; stream the part the deltas did
-    // not carry so the visible text never loses its tail. A single-block answer that
-    // diverged is replaced wholesale at close.
-    let replacement
-    const authoritative = typeof result?.text === 'string' ? result.text : ''
-    if (authoritative !== '' && authoritative !== streamedAnswer) {
-      if (authoritative.startsWith(streamedAnswer)) {
-        yield* emit('text', authoritative.slice(streamedAnswer.length))
-      } else if (textBlocks === 0 || (textBlocks === 1 && open?.type === 'text')) {
-        if (open?.type !== 'text') yield* emit('text', '')
-        replacement = authoritative
-      }
-    }
-    /** Sections appended after the answer; they survive a wholesale replacement. */
-    let appendix = ''
-    const append = function* (text) {
-      const separator = open?.type === 'text' && (replacement ?? open.text) !== '' ? '\n\n' : ''
-      appendix += separator + text
-      yield* emit('text', separator + text)
-    }
-
+    const settled = renderer.finish()
     const aborted = failure !== undefined && (signal?.aborted === true || failure?.name === 'AbortError')
     const files = collectTurnFiles(result)
-    if (!aborted && files.length > 0) await landFiles(files, session, signal)
-    const nonFiles = (Array.isArray(result?.interactions) ? result.interactions : []).filter(item => item?.kind !== 'file')
-    const tail = renderInteractions([...nonFiles, ...files.map(file => ({ kind: 'file', ...file }))])
-
-    // The block-end text is what the Session log keeps, so the final answer is where the
-    // inline COS links are pointed at the workspace copies.
-    const answerText = () => rewriteFileLinks(replacement === undefined ? open?.text ?? '' : replacement + appendix, files)
+    /**
+     * The ADP answer as DSH should keep it: links and images of copied files point at
+     * the workspace (native file buttons, native message images), and images the
+     * browser cannot load become links instead of 「图片无法预览」.
+     */
+    const answerBody = () => demoteUnloadableImages(rewriteFileLinks(settled.answer, files), files, settings.fileDownloadHosts)
     if (aborted) {
-      if (open !== null) yield* closeOpen(open.type === 'text' ? answerText() : undefined)
+      yield* closeAll({ text: answerBody(), reasoning: settled.reasoning })
       const message = failure instanceof Error ? failure.message : String(failure)
       yield { type: 'finish', reason: { kind: 'aborted', failure: { message, code: 'ABORTED' } } }
       return
     }
-    if (tail !== '') yield* append(tail)
+    if (files.length > 0) await landFiles(files, session, signal)
+    // Documents become DSH deliverable cards; images are shown inline as DSH message
+    // images instead, which is how DSH itself presents a picture in a reply.
+    const documents = files.filter(file => !isInlineImage(file))
+    for (const file of presentTurnFiles({ session, turn: route.turn, files: documents, source: route.name })) file.presented = true
+    const body = answerBody()
+    const inlined = new Set(files
+      .filter(file => file.localPath && isInlineImage(file) && body.includes(`](${markdownPath(file.localPath)})`))
+      .map(file => file.localPath))
+    const nonFiles = (Array.isArray(result?.interactions) ? result.interactions : []).filter(item => item?.kind !== 'file')
+    const sections = []
+    const tail = renderInteractions(
+      [...nonFiles, ...files.map(file => ({ kind: 'file', ...file }))],
+      { inlineHosts: settings.fileDownloadHosts, skipImages: inlined },
+    )
+    if (tail !== '') sections.push(tail)
     if (failure !== undefined) {
       const message = failure instanceof Error ? failure.message : String(failure)
-      yield* append(`> ⚠️ ADP 会话失败：${message}`)
+      sections.push(`> ⚠️ ADP 会话失败：${message}`)
       console.error(`[adp-console] @${route.name} 会话失败：${message}`)
     }
-    if (textBlocks === 0) yield* emit('text', '（ADP 应用没有返回任何内容。）')
-    yield* closeOpen(open?.type === 'text' ? answerText() : undefined)
+
+    // A fold that only became visible at completion still precedes nothing it explains
+    // — it is opened here rather than dropped.
+    if (settled.reasoning !== '' && !blocks.has('reasoning')) yield* deliver('reasoning', settled.reasoning)
+    const appendix = sections.join('\n\n')
+    if (appendix !== '') {
+      const streamed = blocks.get('text')?.text ?? ''
+      yield* deliver('text', `${streamed.trim() === '' ? '' : '\n\n'}${appendix}`)
+    }
+    let answer = [body, appendix].filter(part => part !== '').join('\n\n')
+    if (answer === '') answer = files.some(file => file.presented) ? '已生成以下文件：' : '（ADP 应用没有返回任何内容。）'
+    if (!blocks.has('text')) yield* deliver('text', answer)
+    // The block-end text is authoritative and is what the Session log keeps.
+    yield* closeAll({ text: answer, reasoning: settled.reasoning })
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 
@@ -2909,10 +3377,10 @@ export function apply(ctx, config) {
   }
 
   if (settings.mentionEnabled !== false) {
-    ctx.effect(() => ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+    ctx.effect(() => ctx.on('agent/pre-step', async ({ agent, messages, signal, turn }, next) => {
       const decision = await next()
       if (decision.kind === 'reject') return decision
-      const rewritten = await claimMention(agent, decision.messages, signal)
+      const rewritten = await claimMention(agent, decision.messages, signal, turn)
       // Spread: the downstream decision may carry fields this listener knows nothing of.
       return rewritten === undefined ? decision : { ...decision, messages: rewritten }
     }), 'adp-console: @ mention binding')
@@ -2923,8 +3391,11 @@ export function apply(ctx, config) {
       const sessionId = String(options.sessionId)
       const route = mentionRoutes.get(sessionId)
       if (route === undefined) return next()
-      // Optional: without the Session registry the files keep their remote links.
-      const session = ctx.get('sessions')?.get?.(options.sessionId)
+      // The pre-step recorded the owning Session (it carries the workspace and `append`);
+      // the registry lookup is a fallback. Without either, files keep their remote links.
+      const session = route.session?.header !== undefined
+        ? route.session
+        : ctx.get('sessions')?.get?.(options.sessionId) ?? route.session
       return streamMentionReply(sessionId, route, options.signal, session)
     }), 'adp-console: @ mention bridge')
 
@@ -2981,28 +3452,14 @@ export function apply(ctx, config) {
           if (req.method === 'POST' && route === '/config') {
             await stateReady
             const body = await readJsonBody(req)
-            if (body.clear === true) {
-              state.credentials = {}
-            } else {
-              if (typeof body.site === 'string') {
-                if (!Object.hasOwn(SITES, body.site)) {
-                  throw new AdpError(`未知站点 ${body.site}`, { code: 'InvalidArgs' })
-                }
-                state.credentials.site = body.site
-              }
-              for (const field of ['secretId', 'secretKey', 'region', 'spaceId']) {
-                if (typeof body[field] === 'string') {
-                  const value = body[field].trim()
-                  if (value === '') delete state.credentials[field]
-                  else state.credentials[field] = value
-                }
-              }
-            }
-            const touchedSecrets = typeof body.secretId === 'string' || typeof body.secretKey === 'string'
-            if (touchedSecrets && (credentials.secretId === '' || credentials.secretKey === '')) {
-              throw new AdpError('SecretId 和 SecretKey 必须同时提供。', { code: 'InvalidArgs' })
-            }
+            const next = applyCredentialForm(state.credentials, body)
+            // Only a validated form is committed: a refused save used to leave the
+            // in-memory credentials half-edited (the stored key pair already deleted),
+            // and the next unrelated write persisted that loss.
+            const previousKey = `${credentials.secretId}\u0000${credentials.secretKey}\u0000${activeSite()}`
+            state.credentials = next
             await persist()
+            if (`${credentials.secretId}\u0000${credentials.secretKey}\u0000${activeSite()}` !== previousKey) resetMentionIndex()
             // A new key pair (or site) means every cached AppKey and SDK client belongs
             // to the old identity.
             appKeyCache.clear()

@@ -58,7 +58,33 @@ window.__ModuleLoader__.load({
       sourceEnv: '来自环境变量',
       sourceNone: '尚未配置',
       source: '来源',
-      bothRequired: 'SecretId 与 SecretKey 必须同时填写。',
+      bothRequired: '更换密钥时 SecretId 与 SecretKey 需同时填写；两项都留空则保留当前密钥。',
+      keyRequired: '请填写 SecretId 与 SecretKey。',
+      keepHintConfig: '当前使用插件配置里的密钥（{id}）；在这里填写将改用此面板保存的密钥。',
+      keepHintEnv: '当前使用环境变量里的密钥（{id}）；在这里填写将改用此面板保存的密钥。',
+      clearConfirm: '确定清除此面板保存的 SecretId 与 SecretKey？地域、空间与站点设置会保留。',
+      spaceCurrent: '{id}（当前值，不在此密钥可见的空间里）',
+      spacesLoading: '正在读取这把密钥可见的空间…',
+      spacesReload: '重新读取',
+      saved: '已保存。',
+      credentialConfigured: '已配置',
+      credentialMissing: '未配置',
+      keyStored: '已配置——输入新值可替换',
+      secretIdHint: '当前密钥 {id}；留空表示保持当前密钥。',
+      secretKeyHint: '不回显。留空表示保持当前密钥；更换时两项需同时填写。',
+      secretKeyNewHint: '只保存在本机插件状态文件里（权限 0600），不会发回浏览器。',
+      secretNewHint: '在 {source} 获取；两项需同时填写。',
+      keyBlank: '请输入内容；留空则保持已存储的密钥。',
+      keyIllegal: '格式不正确，请检查后重新粘贴。',
+      keyPairMissing: '更换密钥时需同时填写这一项。',
+      removeKey: '移除',
+      overridden: '已覆盖',
+      resetDefault: '恢复默认',
+      inheritPlaceholder: '默认：{value}',
+      followDefault: '跟随默认（{value}）',
+      regionHint: 'ADP 目前只有 ap-guangzhou 一个公开地域。',
+      spaceNameDefault: '默认值 {value} 是空间名称，接口需要 SpaceId；请从列表里选择一个空间。',
+      saveFailed: '没有保存：',
       site: '站点',
       siteCn: '中国站（腾讯云）',
       siteIntl: '国际站',
@@ -156,7 +182,33 @@ window.__ModuleLoader__.load({
       sourceEnv: 'From the environment',
       sourceNone: 'Not configured',
       source: 'Source',
-      bothRequired: 'SecretId and SecretKey must both be filled in.',
+      bothRequired: 'To replace the key, fill in both SecretId and SecretKey; leave both empty to keep the current key.',
+      keyRequired: 'Fill in SecretId and SecretKey.',
+      keepHintConfig: 'Using the key from the plugin config ({id}); entering one here switches to a key saved by this panel.',
+      keepHintEnv: 'Using the key from the environment ({id}); entering one here switches to a key saved by this panel.',
+      clearConfirm: 'Clear the SecretId and SecretKey saved by this panel? Region, space and site are kept.',
+      spaceCurrent: '{id} (current value, not among the spaces this key can see)',
+      spacesLoading: 'Reading the spaces this key can see…',
+      spacesReload: 'Reload',
+      saved: 'Saved.',
+      credentialConfigured: 'Configured',
+      credentialMissing: 'Missing',
+      keyStored: 'Configured — enter a new value to replace',
+      secretIdHint: 'Current key {id}. Leave empty to keep the current key.',
+      secretKeyHint: 'Never shown. Leave empty to keep the current key; replace both fields together.',
+      secretKeyNewHint: 'Stored only in the plugin state file on this machine (mode 0600), never sent back to the browser.',
+      secretNewHint: 'Get it from {source}; fill in both fields.',
+      keyBlank: 'Enter a value, or leave the field empty to keep the stored key.',
+      keyIllegal: 'This is not in a valid format. Please check it and paste again.',
+      keyPairMissing: 'Fill this in too to replace the key.',
+      removeKey: 'Remove',
+      overridden: 'Overridden',
+      resetDefault: 'Reset to default',
+      inheritPlaceholder: 'Default: {value}',
+      followDefault: 'Follow default ({value})',
+      regionHint: 'ap-guangzhou is currently the only public ADP region.',
+      spaceNameDefault: 'The default {value} is a space name, but the API needs a SpaceId; pick a space from the list.',
+      saveFailed: 'Not saved: ',
       site: 'Site',
       siteCn: 'China (Tencent Cloud)',
       siteIntl: 'International',
@@ -437,11 +489,9 @@ window.__ModuleLoader__.load({
       'background-size:200% 100%;animation:adp-shimmer 1.4s linear infinite}',
       '@keyframes adp-shimmer{from{background-position:200% 0}to{background-position:-200% 0}}',
       '.adp-root>.adp-card{flex:0 0 auto}',
-      '.adp-form{display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:8px 12px;padding:12px}',
-      '.adp-form label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.adp-select.wide{width:100%}',
-      '.adp-report{padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l1)}',
-      '.adp-report p{margin:0 0 6px}',
+      '.adp-report{padding:12px 0;border-top:0.5px solid var(--dsw-alias-border-l2)}',
+      '.adp-report p{margin:0 0 6px;padding:0;white-space:pre-line}',
       '.adp-checkrow{display:flex;align-items:center;gap:8px;padding:3px 0}',
       '.adp-checklabel{font-size:12px;color:var(--dsw-alias-label-secondary);white-space:nowrap}',
       '.adp-input.wide{width:100%}',
@@ -449,6 +499,50 @@ window.__ModuleLoader__.load({
       'border-top:1px solid var(--dsw-alias-border-l1);font-size:12px}',
       '.adp-metatext{color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap;',
       'overflow:hidden;text-overflow:ellipsis;max-width:240px}',
+      // Settings form, copied token for token from DSH's own settings primitives
+      // (ui-primitives settings-form/fields.module.css, SettingsForm.module.css, Tag):
+      // label row with state tag, 34px input, one hint line, hairline between fields.
+      '.adp-sf{display:flex;flex-direction:column;padding:4px 16px 16px}',
+      '.adp-sf-note{margin:12px 0 0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+      '.adp-sf-field{display:flex;flex-direction:column;gap:6px;padding:12px 0}',
+      '.adp-sf-field+.adp-sf-field{border-top:0.5px solid var(--dsw-alias-border-l2)}',
+      '.adp-sf-head{display:flex;align-items:center;gap:8px}',
+      '.adp-sf-label{flex:1;min-width:0;font-size:13px;font-weight:500;line-height:1.5;color:var(--dsw-alias-label-primary)}',
+      '.adp-sf-badges{display:inline-flex;align-items:center;gap:8px}',
+      '.adp-sf-reset{border:none;background:none;padding:0;font:inherit;font-size:12px;line-height:1.5;',
+      'color:var(--dsw-alias-label-secondary);cursor:pointer}',
+      '.adp-sf-reset:hover:not(:disabled){color:var(--dsw-alias-label-primary)}',
+      '.adp-sf-reset:disabled{cursor:default}',
+      '.adp-sf-input{height:34px;padding:0 12px;box-sizing:border-box;width:100%;',
+      'border:0.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-md,8px);',
+      'background:var(--dsw-alias-bg-layer-3);font:inherit;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-primary)}',
+      '.adp-sf-input:focus-visible{outline:none;border-color:var(--dsw-alias-state-business-primary)}',
+      '.adp-sf-input:disabled{color:var(--dsw-alias-label-tertiary);cursor:default}',
+      '.adp-sf-input[aria-invalid="true"]{border-color:var(--dsw-alias-state-error-primary)}',
+      'select.adp-sf-input{padding-right:28px}',
+      '.adp-sf-hint{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+      '.adp-sf-invalid{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary)}',
+      '.adp-sf-foot{display:flex;align-items:center;gap:8px;padding-top:16px;flex-wrap:wrap}',
+      '.adp-sf-status{flex:1;min-width:0;margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+      '.adp-sf-status[data-error]{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary))}',
+      '.adp-sf-save{appearance:none;border:1px solid transparent;border-radius:var(--dsw-radius-md,8px);padding:5px 14px;',
+      'font:inherit;font-size:13px;line-height:1.5;cursor:pointer;',
+      'background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3)}',
+      '.adp-sf-save:disabled{opacity:.4;cursor:default}',
+      '.adp-sf-save:focus-visible,.adp-sf-reset:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid ',
+      'var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}',
+      '.adp-sf-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-top:12px;',
+      'border-top:0.5px solid var(--dsw-alias-border-l2);margin-top:4px}',
+      '.adp-tag{display:inline-flex;align-items:center;border-radius:999px;padding:1px 8px;font-size:11px;',
+      'line-height:17px;font-weight:500;white-space:nowrap}',
+      '.adp-tag[data-tone="neutral"]{background:var(--dsw-alias-bg-module-platform,var(--dsw-alias-bg-layer-2));',
+      'color:var(--dsw-alias-label-secondary)}',
+      '.adp-tag[data-tone="quiet"]{color:var(--dsw-alias-label-tertiary)}',
+      '.adp-tag[data-tone="outline"]{border:0.5px solid var(--dsw-alias-border-l4);color:var(--dsw-alias-label-tertiary)}',
+      '.adp-tag[data-tone="success"]{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 10%,transparent);',
+      'color:var(--dsw-alias-state-success-primary)}',
+      '.adp-tag[data-tone="danger"]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);',
+      'color:var(--dsw-alias-state-error-primary)}',
     ].join('');
 
     /** Locale keys for the ADP `AppStatus` enum, so the UI follows the active locale. */
@@ -1390,93 +1484,216 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Credential and scope settings, persisted by the Host half. */
+    /** Fill `{name}` placeholders in a translated string. */
+    function fill(template, values) {
+      return String(template).replace(/\{(\w+)\}/g, (match, name) => (values[name] === undefined ? match : String(values[name])));
+    }
+
+    /** Printable ASCII without space: DSH's own key charset (`normalizeApiKey`). */
+    const LEGAL_SECRET = /^[\x21-\x7E]+$/;
+    /** A pasted `NAME=value` line (DSH `apiKey.ts`): upper-case name, then `=` and not `=`. */
+    const ENV_LINE = /^[A-Z][A-Z0-9_]*=[^=]/;
+
+    /**
+     * Judge one secret input the way DSH judges a typed API key: empty is not a failure
+     * (it means keep the stored key), whitespace only is, and so is anything outside
+     * printable ASCII, a quoted paste or an environment line.
+     * @returns a copy key, or '' when the draft may be submitted.
+     */
+    function secretFailure(draft) {
+      if (draft.length === 0) return '';
+      const value = draft.trim();
+      if (value === '') return 'keyBlank';
+      const quoted = value.length > 1 && /^["'`]/.test(value) && value.endsWith(value[0]);
+      if (ENV_LINE.test(value) || quoted || !LEGAL_SECRET.test(value)) return 'keyIllegal';
+      return '';
+    }
+
+    /** DSH's read-only capsule badge. */
+    function Tag(props) {
+      return h('span', { className: 'adp-tag', 'data-tone': props.tone || 'outline' }, props.children);
+    }
+
+    /**
+     * One settings field in DSH's layout (`SettingsValueField` / `SettingsSecretField`):
+     * label with its badges, the control, then one line that is the hint — or, while
+     * the draft is invalid, the reason in its place.
+     */
+    function SettingsField(props) {
+      const { id, label, badges, control, hint, invalid } = props;
+      const messageId = `${id}-message`;
+      const message = invalid || hint;
+      return h('div', { className: 'adp-sf-field' },
+        h('div', { className: 'adp-sf-head' },
+          h('label', { className: 'adp-sf-label', htmlFor: id }, label),
+          badges ? h('span', { className: 'adp-sf-badges' }, badges) : null),
+        React.cloneElement(control, {
+          id,
+          'aria-invalid': invalid ? 'true' : undefined,
+          'aria-describedby': message ? messageId : undefined,
+        }),
+        message ? h('p', { id: messageId, className: invalid ? 'adp-sf-invalid' : 'adp-sf-hint' }, message) : null);
+    }
+
+    /**
+     * Credential and scope settings, persisted by the Host half — built on DSH's own
+     * settings-form rules (ui-primitives `SettingsForm` / `form-model`):
+     * - secrets are write-only: the inputs open blank, a tag states 已配置 / 未配置, and a
+     *   blank draft keeps the stored key; typing replaces it (both halves together);
+     * - a preference shows 「已覆盖 · 恢复默认」 when the panel overrides the plugin
+     *   default, and an empty draft re-inherits that default;
+     * - one explicit 保存, disabled while nothing changed, a draft is invalid or a save
+     *   is in flight; a refused save keeps the drafts and says why beside the button;
+     * - leaving (collapsing) the card drops the drafts; there is no discard control.
+     */
     function SettingsCard(props) {
       const { config, t, onSaved, onClose } = props;
-      const [secretId, setSecretId] = useState('');
-      const [secretKey, setSecretKey] = useState('');
-      const [region, setRegion] = useState(config?.region || 'ap-guangzhou');
-      const [spaceId, setSpaceId] = useState(config?.spaceId || 'default_space');
-      const [site, setSite] = useState(config?.site || 'cn');
+      const overrides = config?.overrides || {};
+      const defaults = config?.defaults || {};
+      const [secretId, setSecretIdRaw] = useState('');
+      const [secretKey, setSecretKeyRaw] = useState('');
+      const [region, setRegionRaw] = useState(overrides.region || '');
+      const [spaceId, setSpaceIdRaw] = useState(overrides.spaceId || '');
+      const [site, setSiteRaw] = useState(overrides.site || '');
       const [spaces, setSpaces] = useState(null);
+      const [spacesLoading, setSpacesLoading] = useState(false);
       const [spacesError, setSpacesError] = useState('');
-      const [busy, setBusy] = useState(false);
+      /** The action in flight: '' | 'save' | 'verify' | 'clear'. */
+      const [action, setAction] = useState('');
       const [failure, setFailure] = useState('');
+      const [notice, setNotice] = useState('');
       const [report, setReport] = useState(null);
+      const busy = action !== '';
+      const configured = config?.configured === true;
+      const source = config?.source || 'none';
 
-      useEffect(() => {
-        setRegion(config?.region || 'ap-guangzhou');
-        setSpaceId(config?.spaceId || 'default_space');
-        setSite(config?.site || 'cn');
-      }, [config]);
+      /** Any edit makes the last result stale, as DSH clears saveFailed on the next edit. */
+      const edited = setter => (value) => {
+        setter(value);
+        setFailure('');
+        setNotice('');
+      };
+      const setSecretId = edited(setSecretIdRaw);
+      const setSecretKey = edited(setSecretKeyRaw);
+      const setRegion = edited(setRegionRaw);
+      const setSpaceId = edited(setSpaceIdRaw);
+      const setSite = edited(setSiteRaw);
 
-      // The API needs the SpaceId, not the space name (`default_space` is a name), so
-      // offer the real ids whenever the current key can list them.
+      // Adopt the saved overrides when they change (after a save), not on every refresh:
+      // re-reading the same config must not discard what is being typed.
+      useEffect(() => { setRegionRaw(overrides.region || ''); }, [overrides.region]);
+      useEffect(() => { setSpaceIdRaw(overrides.spaceId || ''); }, [overrides.spaceId]);
+      useEffect(() => { setSiteRaw(overrides.site || ''); }, [overrides.site]);
+
+      // The API needs the SpaceId, not the space name, so offer the real ids whenever
+      // the active key can list them. Only the newest request may land.
+      const spacesRequest = useRef(0);
       const loadSpaces = useCallback(async () => {
+        const ticket = ++spacesRequest.current;
         setSpacesError('');
+        setSpacesLoading(true);
         try {
           const result = await api('/spaces');
-          setSpaces(Array.isArray(result.spaces) ? result.spaces : []);
+          if (ticket === spacesRequest.current) setSpaces(Array.isArray(result.spaces) ? result.spaces : []);
         } catch (cause) {
-          setSpaces([]);
-          setSpacesError(String(cause.message || cause).split('\n')[0]);
+          if (ticket === spacesRequest.current) {
+            setSpaces([]);
+            setSpacesError(String(cause.message || cause).split('\n')[0]);
+          }
+        } finally {
+          if (ticket === spacesRequest.current) setSpacesLoading(false);
+        }
+      }, []);
+      useEffect(() => {
+        if (configured) void loadSpaces();
+        else {
+          spacesRequest.current += 1;
+          setSpaces(null);
+          setSpacesLoading(false);
+        }
+      }, [configured, config?.secretIdHint, config?.site, config?.region, loadSpaces]);
+
+      // A typed space *name* is resolved to its id, so what is saved is what ADP needs.
+      const listed = Array.isArray(spaces) ? spaces : [];
+      const resolveSpace = (value) => {
+        const trimmed = value.trim();
+        if (trimmed === '') return '';
+        const hit = listed.find(space => space.spaceId === trimmed) || listed.find(space => space.name === trimmed);
+        return hit ? hit.spaceId : trimmed;
+      };
+      const spaceSubmit = resolveSpace(spaceId);
+      const defaultSpace = String(defaults.spaceId || '');
+      const defaultIsName = spaceSubmit === '' && listed.length > 0
+        && !listed.some(space => space.spaceId === defaultSpace) && listed.some(space => space.name === defaultSpace);
+
+      // Field judgements.
+      const idFailure = secretFailure(secretId);
+      const keyFailure = secretFailure(secretKey);
+      const typedId = secretId.trim() !== '';
+      const typedKey = secretKey.trim() !== '';
+      const typedSecret = typedId || typedKey;
+      const idInvalid = idFailure !== '' ? t(idFailure) : typedKey && !typedId ? t('keyPairMissing') : '';
+      const keyInvalid = keyFailure !== '' ? t(keyFailure) : typedId && !typedKey ? t('keyPairMissing') : '';
+      const invalid = idInvalid !== '' || keyInvalid !== '' || (!configured && !typedSecret);
+
+      const dirty = typedSecret
+        || region.trim() !== (overrides.region || '')
+        || spaceSubmit !== (overrides.spaceId || '')
+        || site !== (overrides.site || '');
+
+      /** Validate and persist the form; secrets are sent only as a complete new pair. */
+      const persistForm = useCallback(async () => {
+        const body = { region: region.trim(), spaceId: spaceSubmit, site };
+        if (typedSecret) {
+          body.secretId = secretId.trim();
+          body.secretKey = secretKey.trim();
+        }
+        const result = await api('/config', { method: 'POST', body: JSON.stringify(body) });
+        setSecretIdRaw('');
+        setSecretKeyRaw('');
+        return result;
+      }, [region, secretId, secretKey, site, spaceSubmit, typedSecret]);
+
+      const run = useCallback(async (name, work) => {
+        setAction(name);
+        setFailure('');
+        setNotice('');
+        setReport(null);
+        try {
+          await work();
+        } catch (cause) {
+          setFailure(String(cause.message || cause));
+        } finally {
+          setAction('');
         }
       }, []);
 
-      useEffect(() => {
-        if (config?.configured) void loadSpaces();
-        else setSpaces(null);
-      }, [config?.configured, loadSpaces]);
+      const save = () => run('save', async () => {
+        await persistForm();
+        setNotice(t('saved'));
+        await onSaved();
+      });
 
-      /** Persist whatever the form currently holds, so a test uses the same values. */
-      const persistForm = useCallback(async () => {
-        if ((secretId.trim() === '') !== (secretKey.trim() === '')) {
-          throw new Error(t('bothRequired'));
+      // Test what the form shows: unsaved edits are saved first, otherwise the saved
+      // settings are tested as they are.
+      const verify = () => run('verify', async () => {
+        if (dirty) {
+          await persistForm();
+          await onSaved({ keepOpen: true });
         }
-        return api('/config', {
-          method: 'POST',
-          body: JSON.stringify({
-            secretId: secretId.trim(),
-            secretKey: secretKey.trim(),
-            region: region.trim(),
-            spaceId: spaceId.trim(),
-            site,
-          }),
+        setReport(await api('/verify', { method: 'POST', body: JSON.stringify({}) }));
+      });
+
+      // DSH removes a stored key as its own confirmed action, never by an empty field.
+      const removeKey = () => {
+        if (typeof window.confirm === 'function' && !window.confirm(t('clearConfirm'))) return;
+        void run('clear', async () => {
+          await api('/config', { method: 'POST', body: JSON.stringify({ clear: true }) });
+          setSecretIdRaw('');
+          setSecretKeyRaw('');
+          await onSaved({ keepOpen: true });
         });
-      }, [region, secretId, secretKey, site, spaceId, t]);
-
-      const save = useCallback(async () => {
-        setBusy(true);
-        setFailure('');
-        setReport(null);
-        try {
-          await persistForm();
-          setSecretId('');
-          setSecretKey('');
-          await onSaved();
-        } catch (cause) {
-          setFailure(String(cause.message || cause));
-        } finally {
-          setBusy(false);
-        }
-      }, [onSaved, persistForm]);
-
-      const verify = useCallback(async () => {
-        setBusy(true);
-        setFailure('');
-        setReport(null);
-        try {
-          await persistForm();
-          setSecretId('');
-          setSecretKey('');
-          const result = await api('/verify', { method: 'POST', body: JSON.stringify({}) });
-          setReport(result);
-        } catch (cause) {
-          setFailure(String(cause.message || cause));
-        } finally {
-          setBusy(false);
-        }
-      }, [persistForm]);
+      };
 
       const VERDICT_KEY = {
         ok: 'verdictOk',
@@ -1484,130 +1701,180 @@ window.__ModuleLoader__.load({
         'wrong-site': 'verdictWrongSite',
         'adp-permission': 'verdictAdpPermission',
       };
-
-      const clear = useCallback(async () => {
-        setBusy(true);
-        setFailure('');
-        try {
-          await api('/config', { method: 'POST', body: JSON.stringify({ clear: true }) });
-          await onSaved();
-        } catch (cause) {
-          setFailure(String(cause.message || cause));
-        } finally {
-          setBusy(false);
-        }
-      }, [onSaved]);
-
+      const SITE_LABEL = { cn: 'siteCn', intl: 'siteIntl', standalone: 'siteStandalone' };
       const sourceLabel = {
-        panel: t('sourcePanel'),
-        config: t('sourceConfig'),
-        env: t('sourceEnv'),
-        none: t('sourceNone'),
-      }[config?.source] || t('sourceNone');
+        panel: t('sourcePanel'), config: t('sourceConfig'), env: t('sourceEnv'), none: t('sourceNone'),
+      }[source] || t('sourceNone');
 
-      const field = (label, control) => [
-        h('label', { key: `${label}-l` }, label),
-        h(React.Fragment, { key: `${label}-c` }, control),
-      ];
+      const stateTag = h(Tag, { tone: configured ? 'neutral' : 'quiet' },
+        configured ? t('credentialConfigured') : t('credentialMissing'));
+      let idHint = fill(t('secretNewHint'), { source: config?.keySource || 'ADP' });
+      if (configured) {
+        idHint = source === 'config' ? fill(t('keepHintConfig'), { id: config.secretIdHint })
+          : source === 'env' ? fill(t('keepHintEnv'), { id: config.secretIdHint })
+            : fill(t('secretIdHint'), { id: config?.secretIdHint || '' });
+      }
+      /** 「已覆盖 · 恢复默认」 while saving would keep a panel override for the field. */
+      const overrideBadges = (draft, reset) => (draft === '' ? null : [
+        h(Tag, { key: 'tag', tone: 'neutral' }, t('overridden')),
+        h('button', { key: 'reset', type: 'button', className: 'adp-sf-reset', disabled: busy, onClick: reset }, t('resetDefault')),
+      ]);
+
+      let spaceHint = t('spacesUnloaded');
+      if (spacesLoading) spaceHint = t('spacesLoading');
+      else if (spacesError !== '') spaceHint = `${t('spacesFailed')}${spacesError}`;
+      else if (listed.length > 0) spaceHint = t('spacesHint');
+      const spaceControl = listed.length > 0
+        ? h('select', {
+          className: 'adp-sf-input',
+          value: spaceSubmit,
+          disabled: busy,
+          onChange: event => setSpaceId(event.target.value),
+        },
+          h('option', { key: '(default)', value: '' }, fill(t('followDefault'), { value: defaultSpace })),
+          // Never silently show another space than the one that will be saved.
+          spaceSubmit !== '' && !listed.some(space => space.spaceId === spaceSubmit)
+            ? h('option', { key: '(current)', value: spaceSubmit }, fill(t('spaceCurrent'), { id: spaceSubmit }))
+            : null,
+          listed.map(space => h('option', { key: space.spaceId, value: space.spaceId },
+            `${space.name || '(无名称)'} · ${space.spaceId}`)))
+        : h('input', {
+          className: 'adp-sf-input',
+          type: 'text',
+          value: spaceId,
+          placeholder: fill(t('inheritPlaceholder'), { value: defaultSpace }),
+          spellCheck: false,
+          disabled: busy,
+          onChange: event => setSpaceId(event.target.value),
+        });
+
+      const statusText = failure !== '' ? `${t('saveFailed')}${failure}` : notice !== '' && !dirty ? notice : '';
 
       return h('section', { className: 'adp-card' },
         h('div', { className: 'adp-cardhead' },
           h('span', null, t('settingsTitle')),
           onClose ? h('button', { className: 'adp-btn', type: 'button', onClick: onClose }, t('settingsClose')) : null,
         ),
-        config?.configured === false ? h('p', { className: 'adp-note' }, t('unconfiguredBody')) : null,
-        h('div', { className: 'adp-form' },
-          field(t('secretId'), h('input', {
-            className: 'adp-input wide',
-            value: secretId,
-            placeholder: config?.secretIdHint || 'AKID…',
-            autoComplete: 'off',
-            spellCheck: false,
-            onChange: event => setSecretId(event.target.value),
-          })),
-          field(t('secretKey'), h('input', {
-            className: 'adp-input wide',
-            type: 'password',
-            value: secretKey,
-            placeholder: config?.hasSecretKey ? '••••••••' : '',
-            autoComplete: 'new-password',
-            onChange: event => setSecretKey(event.target.value),
-          })),
-          field(t('region'), h('input', {
-            className: 'adp-input wide',
-            value: region,
-            spellCheck: false,
-            onChange: event => setRegion(event.target.value),
-          })),
-          field(t('spaceId'), spaces !== null && spaces.length > 0
-            ? h('select', {
-              className: 'adp-select wide',
-              value: spaces.some(space => space.spaceId === spaceId) ? spaceId : spaces[0].spaceId,
-              onChange: event => setSpaceId(event.target.value),
-            }, spaces.map(space => h('option', {
-              key: space.spaceId,
-              value: space.spaceId,
-            }, `${space.name || '(无名称)'} · ${space.spaceId}`)))
-            : h('input', {
-              className: 'adp-input wide',
-              value: spaceId,
+        h('div', { className: 'adp-sf' },
+          !configured ? h('p', { className: 'adp-sf-note' }, t('unconfiguredBody')) : null,
+          h(SettingsField, {
+            id: 'adp-f-sid',
+            label: t('secretId'),
+            badges: stateTag,
+            invalid: idInvalid,
+            hint: idHint,
+            control: h('input', {
+              className: 'adp-sf-input',
+              type: 'text',
+              value: secretId,
+              placeholder: configured ? t('keyStored') : 'AKID…',
+              autoComplete: 'off',
               spellCheck: false,
-              onChange: event => setSpaceId(event.target.value),
-            })),
-          field('', h('span', { className: 'adp-metatext' },
-            spacesError !== ''
-              ? `${t('spacesFailed')}${spacesError}`
-              : spaces !== null && spaces.length > 0
-                ? t('spacesHint')
-                : t('spacesUnloaded'))),
-          field(t('site'), h('select', {
-            className: 'adp-select wide',
-            value: site,
-            onChange: event => setSite(event.target.value),
-          },
-            h('option', { value: 'cn' }, t('siteCn')),
-            h('option', { value: 'intl' }, t('siteIntl')),
-            h('option', { value: 'standalone' }, t('siteStandalone')),
-          )),
-          field('', h('span', { className: 'adp-metatext', title: t('siteHint') },
-            `${t('siteHint')}${config?.keySource ? ` ${t('keySourceHint')}${config.keySource}` : ''}`)),
-        ),
-        failure !== '' ? h('p', { className: 'adp-error' }, failure) : null,
-        report !== null
-          ? h('div', { className: 'adp-report' },
-            h('p', {
-              className: report.verdict === 'ok' ? 'adp-note' : 'adp-error',
-            }, `${t(VERDICT_KEY[report.verdict] || 'verdictBadKey')}\n`
-              + `${t('verdictForSite')}${t({ cn: 'siteCn', intl: 'siteIntl', standalone: 'siteStandalone' }[report.site] || 'siteCn')}`
-              + `${config?.keySource ? ` · ${t('keySourceHint')}${config.keySource}` : ''}`),
-            (report.checks || []).map(check => h('div', { key: check.id, className: 'adp-checkrow' },
-              h('span', { className: `adp-pill ${check.ok ? 'on' : 'warn'}` }, check.ok ? t('checkOk') : t('checkFail')),
-              h('span', { className: 'adp-checklabel' }, `${check.label} · ${check.endpoint}`),
-              h('span', { className: 'adp-metatext', title: check.message }, check.message),
-            )),
-          )
-          : null,
-        h('div', { className: 'adp-formfoot' },
-          h('span', { className: 'adp-pill' }, `${t('source')}: ${sourceLabel}`),
-          h('span', { className: 'adp-metatext' },
-            config?.sdk?.transport === 'sdk' ? t('sdkOn') : config?.sdk?.enabled === false ? t('sdkOff') : t('sdkFallback')),
-          h('span', { className: 'adp-metatext', title: config?.statePath || '' }, config?.statePath || ''),
-          h('span', { style: { flex: '1 1 auto' } }),
-          config?.configured
-            ? h('button', { className: 'adp-btn', type: 'button', disabled: busy, onClick: clear }, t('clearCredentials'))
+              disabled: busy,
+              onChange: event => setSecretId(event.target.value),
+            }),
+          }),
+          h(SettingsField, {
+            id: 'adp-f-skey',
+            label: t('secretKey'),
+            badges: [
+              h(React.Fragment, { key: 'tag' }, stateTag),
+              // Only the panel's own key can be removed here; a config / env key is not ours.
+              source === 'panel'
+                ? h('button', { key: 'remove', type: 'button', className: 'adp-sf-reset', disabled: busy, onClick: removeKey },
+                  action === 'clear' ? t('saving') : t('removeKey'))
+                : null,
+            ],
+            invalid: keyInvalid,
+            hint: configured ? t('secretKeyHint') : t('secretKeyNewHint'),
+            control: h('input', {
+              className: 'adp-sf-input',
+              type: 'password',
+              value: secretKey,
+              placeholder: configured ? t('keyStored') : '',
+              autoComplete: 'new-password',
+              disabled: busy,
+              onChange: event => setSecretKey(event.target.value),
+            }),
+          }),
+          h(SettingsField, {
+            id: 'adp-f-region',
+            label: t('region'),
+            badges: overrideBadges(region.trim(), () => setRegion('')),
+            hint: t('regionHint'),
+            control: h('input', {
+              className: 'adp-sf-input',
+              type: 'text',
+              value: region,
+              placeholder: fill(t('inheritPlaceholder'), { value: defaults.region || '' }),
+              spellCheck: false,
+              disabled: busy,
+              onChange: event => setRegion(event.target.value),
+            }),
+          }),
+          h(SettingsField, {
+            id: 'adp-f-space',
+            label: t('spaceId'),
+            badges: [
+              h(React.Fragment, { key: 'override' }, overrideBadges(spaceSubmit, () => setSpaceId(''))),
+              configured && !spacesLoading
+                ? h('button', { key: 'reload', type: 'button', className: 'adp-sf-reset', disabled: busy, onClick: () => void loadSpaces() },
+                  t('spacesReload'))
+                : null,
+            ],
+            invalid: defaultIsName ? fill(t('spaceNameDefault'), { value: defaultSpace }) : '',
+            hint: spaceHint,
+            control: spaceControl,
+          }),
+          h(SettingsField, {
+            id: 'adp-f-site',
+            label: t('site'),
+            badges: overrideBadges(site, () => setSite('')),
+            hint: `${t('siteHint')}${config?.keySource ? ` ${t('keySourceHint')}${config.keySource}` : ''}`,
+            control: h('select', {
+              className: 'adp-sf-input',
+              value: site,
+              disabled: busy,
+              onChange: event => setSite(event.target.value),
+            },
+              h('option', { value: '' }, fill(t('followDefault'), { value: t(SITE_LABEL[defaults.site] || 'siteCn') })),
+              h('option', { value: 'cn' }, t('siteCn')),
+              h('option', { value: 'intl' }, t('siteIntl')),
+              h('option', { value: 'standalone' }, t('siteStandalone'))),
+          }),
+          report !== null
+            ? h('div', { className: 'adp-report' },
+              h('p', {
+                className: report.verdict === 'ok' ? 'adp-note' : 'adp-error',
+              }, `${t(VERDICT_KEY[report.verdict] || 'verdictBadKey')}\n`
+                + `${t('verdictForSite')}${t(SITE_LABEL[report.site] || 'siteCn')}`
+                + `${config?.keySource ? ` · ${t('keySourceHint')}${config.keySource}` : ''}`),
+              (report.checks || []).map(check => h('div', { key: check.id, className: 'adp-checkrow' },
+                h(Tag, { tone: check.ok ? 'success' : 'danger' }, check.ok ? t('checkOk') : t('checkFail')),
+                h('span', { className: 'adp-checklabel' }, `${check.label} · ${check.endpoint}`),
+                h('span', { className: 'adp-metatext', title: check.message }, check.message),
+              )),
+            )
             : null,
-          h('button', {
-            className: 'adp-btn',
-            type: 'button',
-            disabled: busy,
-            onClick: verify,
-          }, busy ? t('verifying') : t('verify')),
-          h('button', {
-            className: 'adp-btn primary',
-            type: 'button',
-            disabled: busy,
-            onClick: save,
-          }, busy ? t('saving') : t('save')),
+          h('div', { className: 'adp-sf-meta' },
+            h(Tag, { tone: 'outline' }, `${t('source')}: ${sourceLabel}`),
+            h('span', { className: 'adp-metatext' },
+              config?.sdk?.transport === 'sdk' ? t('sdkOn') : config?.sdk?.enabled === false ? t('sdkOff') : t('sdkFallback')),
+            h('span', { className: 'adp-metatext', title: config?.statePath || '' }, config?.statePath || '')),
+          h('div', { className: 'adp-sf-foot' },
+            h('p', { className: 'adp-sf-status', role: 'status', 'data-error': failure !== '' ? '' : undefined }, statusText),
+            h('button', {
+              className: 'adp-btn',
+              type: 'button',
+              disabled: busy || invalid,
+              onClick: () => void verify(),
+            }, action === 'verify' ? t('verifying') : t('verify')),
+            h('button', {
+              className: 'adp-sf-save',
+              type: 'button',
+              disabled: busy || invalid || !dirty,
+              onClick: () => void save(),
+            }, action === 'save' ? t('saving') : t('save'))),
         ),
       );
     }
@@ -1903,8 +2170,9 @@ window.__ModuleLoader__.load({
           ? h(SettingsCard, {
             config,
             t,
-            onSaved: async () => {
-              setShowSettings(false);
+            onSaved: async (options) => {
+              // Saving closes the card; a test or a clear keeps it open for the result.
+              if (!options?.keepOpen) setShowSettings(false);
               // New credentials mean a different catalogue behind the `@` menu too.
               invalidateMentions();
               await load();

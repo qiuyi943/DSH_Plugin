@@ -182,15 +182,29 @@ v1 把它渲染成可回答的 Markdown（标题、问题、选项 label + 说�
 
 ### ADP 报文 → DSH 会话展示的字段映射
 
+一个 ADP 回合在 DSH 里**最多两个块**：一个折叠的「思考」（`reasoning`）装整个过程，一个正文（`text`）装回答。
+两块按 index 并发流式输出（宿主的 chunk 协议允许交错，`block-end` 的文本为准）。
+DSH 把每个 `reasoning` 块画成单独一行「思考」，早先按 ADP 消息逐条开块，一个 Claw 回合会变成
+30–70 行「思考」与零碎正文交替。映射由 `createMentionRenderer()` 完成：
+
 | ADP 报文 | DSH 会话展示 |
 | --- | --- |
-| `Message.Type = thought` 的 `text.delta` | 折叠的「思考过程」（`reasoning` 块） |
-| `Message.Type = tool_call`（`ExtraInfo.ToolName` + `message.processing` 的 `Title`） | 思考过程里的一行 `🔧 工具：具体调用` |
-| `Message.Type = reply` | 正文（`text` 块，Markdown） |
+| `Message.Type = thought`（`content.added` 首段 + `text.delta` / `text.replace`） | 思考折叠里的一段 |
+| `Message.Type = tool_call`（`ExtraInfo.ToolName` + `message.processing` 的 `Title`） | 思考折叠里的一行 `- 🔧 **工具** · 摘要`：`Agent({…})` 这类原始调用取最有描述性的参数，命令行显示为行内代码，`Status = failed` 标 `⚠️ 失败`；通用标题「工具执行」不覆盖具体调用 |
+| 子智能体消息（`ExtraInfo.IsSubAgent` / `ParentMessageId`） | 思考折叠里一段引用，标题 `↳ 子智能体 · 任务`，**不进正文** |
+| 顶层 `Message.Type = reply` | 正文，实时流式。之后又有步骤的 reply 是过程播报（「继续搜索…」）：回合结束时移入折叠原位（`💬 …`），正文只留最终回复；回合没有最终回复（超时、出错）时播报保留在正文 |
+| `text.replace`、`message.done` / `response.completed` 的完整内容 | 按 `ContentIndex` 校正；流式漏掉的结尾补齐，替换不再重复拼接 |
 | `Content.Type = file` → `Content.File{FileName,FileUrl,FileSize,FileType}` | 复制到会话工作区 `adp-output/`，正文末尾「产出文件」列出**可点击预览的本地链接**（HTML/Office/PDF/代码在右侧栏打开），图片同时内联显示，附大小与类型、`原始下载` 链接 |
-| 正文里指向该文件的 COS 链接（签名会变） | 按 origin + path 匹配，改写为工作区路径，点击即本地预览 |
+| 图片文件（png/jpg/webp/gif/svg…） | 复制成功后以工作区路径内联为 **DSH 原生消息图片**（点击放大），不再重复列出、不做卡片；无法加载的远程图片（沙箱地址需要 token）不内联，改为 DSH 原生外链，避免「图片无法预览」 |
+| 未能复制的文件 | 正文末尾「产出文件」一行一个 DSH 原生链接（工作区路径是文件按钮、远程地址是外链），不加 📄 前缀以免与原生图标重复，不显示 ADP 未测量的 `0 B` |
+| 正文里指向该文件的 COS 链接（签名会变） | 按 origin + path（沙箱地址另加 `?path=`）匹配，改写为工作区路径，点击即本地预览 |
 | `Content.References[]`（`Name`/`DocName`/`DocRefer.Url`/`WebSearchRefer.Url`） | 「参考来源」编号链接列表 |
 | `questionnaire` | 见上一节 |
+
+卡片来自会话日志里的 `deliverables/presented` 事件（`presentTurnFiles()` 写入，`callId` 为 `adp-` 前缀的合成 id），
+而不是消息里的 `file` 块：DSH 会把助手消息里的 `file` 块画成「未知内容块」JSON。
+回合尾部只收录在本轮收尾 `assistant/message` **之前**登记的产物，所以登记发生在 `llm/stream` 输出结束块之前；
+卡片的打开动作只解析工作区内的路径，远程 URL 无法做成卡片。需要宿主加载 `@deepseek-ai/dsh-client-ui-deliverables`（桌面端默认组合已包含）。
 
 文件元数据嵌套在 `Content.File` 里；早期实现读的是 `Content.FileName`/`Content.FileUrl`，
 真实报文里这两个字段不存在，于是只剩一行无名、无链接的「📄 产出文件」。`fileInfoOf()`
@@ -253,7 +267,7 @@ URL 凭据）；**实际连接的解析地址**必须是公网地址（拒绝回
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /adp-console/config` | 配置概览（密钥只回掩码） |
-| `POST /adp-console/config` | 保存 / 清除密钥（`{clear:true}` 清除，`{site:'cn'\|'intl'}` 切站点） |
+| `POST /adp-console/config` | 保存设置（`applyCredentialForm()`）：SecretId / SecretKey **留空即保留已保存的密钥**，更换时两项必须同时提供；`region` / `spaceId` / `site` 为空回落到插件配置（`GET /config` 的 `defaults` / `overrides` 供表单显示「已覆盖 · 恢复默认」）；密钥字符集与 DSH 一致（可打印 ASCII、不含空格）；`{clear:true}` 只清除面板保存的密钥，地域、空间、站点保留；校验失败时内存与磁盘都不改动 |
 | `GET /adp-console/apps` | 应用清单（`query` / `status` / `pageSize` / `pageNumber`） |
 | `GET /adp-console/spaces` | 这把密钥能看到的真实 SpaceId 列表 |
 | `POST /adp-console/enabled` | 上架 / 下架 `{appId, enabled}` |
